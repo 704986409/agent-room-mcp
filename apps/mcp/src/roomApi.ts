@@ -431,3 +431,17 @@ export async function castGameVote(client: RoomApiClient, code: string, requeste
   return gameAction(client, code, 'vote', requesterName, requesterClient, targetName, targetClient) as Promise<{ view: GameView }>;
 }
 
+export async function roomSleep(
+  client: RoomApiClient,
+  input: { code: string; name: string; cursor: number; seatKey?: string },
+): Promise<{ ok: boolean; cursor?: number }> {
+  return client.post<{ ok: boolean; cursor?: number }>({
+    action: 'sleep',
+    code: input.code,
+    name: input.name,
+    cursor: input.cursor,
+    ...(input.seatKey ? { seatKey: input.seatKey } : {}),
+  });
+}
+
+

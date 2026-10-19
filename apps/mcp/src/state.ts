@@ -3,7 +3,9 @@ import { homedir } from 'os';
 import { join, dirname } from 'path';
 import { detectHarness, harnessRunId } from './harness.js';
 
-const STATE_DIR = process.env.AGENT_ROOM_STATE_DIR || join(homedir(), '.agent-room');
+export function getStateDir(): string {
+  return process.env.AGENT_ROOM_STATE_DIR || join(homedir(), '.agent-room');
+}
 
 // PPID-scoped state. Two parallel sessions on the same machine end up with
 // distinct files — without this, the later writer's `name` would clobber the
@@ -20,9 +22,12 @@ const STATE_DIR = process.env.AGENT_ROOM_STATE_DIR || join(homedir(), '.agent-ro
 //
 // Override with AGENT_ROOM_STATE_FILE to share state across sessions on purpose
 // (e.g. integration tests).
-const STATE_FILE =
-  process.env.AGENT_ROOM_STATE_FILE ||
-  join(STATE_DIR, `state-${process.ppid ?? process.pid}.json`);
+export function getStateFile(): string {
+  return (
+    process.env.AGENT_ROOM_STATE_FILE ||
+    join(getStateDir(), `state-${process.ppid ?? process.pid}.json`)
+  );
+}
 
 function runScopedHarnessStateFile(kind: string): string | null {
   if (process.env.AGENT_ROOM_STATE_FILE) return null;
@@ -33,7 +38,7 @@ function runScopedHarnessStateFile(kind: string): string | null {
   // then see the wrong room. Keep the stable filename shape for the harness,
   // but include the thread identity supplied by the harness.
   const safeRunId = runId.replace(/[^a-zA-Z0-9._-]/g, '_');
-  return join(STATE_DIR, `state-harness-${kind}-${safeRunId}.json`);
+  return join(getStateDir(), `state-harness-${kind}-${safeRunId}.json`);
 }
 
 function currentHarnessStateFile(): string | null {
@@ -47,7 +52,7 @@ function currentHarnessStateFile(): string | null {
   // same position. A SHARED harness file is unsafe there: it would broadcast
   // rooms to every thread on that harness. Fall back to the PPID-scoped file.
   if (kind === 'codex' || kind === 'claude-code') return null;
-  return join(STATE_DIR, `state-harness-${kind}.json`);
+  return join(getStateDir(), `state-harness-${kind}.json`);
 }
 
 /** True when this process can resolve a run-scoped harness state file, i.e. the
@@ -82,6 +87,8 @@ export interface RoomState {
   // recorded at join time. `clientKind` only partitions by client *type*, so
   // two Codex threads still share a partition; this is what separates them.
   ownerRunId?: string;
+  // Per-seat credential returned by joinRoom for managed wakeups and handoffs.
+  seatKey?: string;
 }
 
 /**
@@ -165,7 +172,7 @@ async function readStateFile(file: string): Promise<AgentRoomState> {
 }
 
 export async function readState(): Promise<AgentRoomState> {
-  return readStateFile(STATE_FILE);
+  return readStateFile(getStateFile());
 }
 
 /**
@@ -219,6 +226,7 @@ export function mergeStates(states: AgentRoomState[]): AgentRoomState {
           ? Math.max(existing.gameVersion ?? -1, room.gameVersion ?? -1)
           : undefined,
         hostKey: winner.hostKey ?? existing.hostKey ?? room.hostKey,
+        seatKey: winner.seatKey ?? existing.seatKey ?? room.seatKey,
       };
     }
   }
@@ -227,19 +235,19 @@ export function mergeStates(states: AgentRoomState[]): AgentRoomState {
 }
 
 async function listStateFiles(): Promise<string[]> {
-  if (process.env.AGENT_ROOM_STATE_FILE) return [STATE_FILE];
+  if (process.env.AGENT_ROOM_STATE_FILE) return [getStateFile()];
 
   let files: string[] = [];
   try {
-    const entries = await fs.readdir(STATE_DIR);
+    const entries = await fs.readdir(getStateDir());
     files = entries
       .filter((name) => /^state-(?:\d+|harness-[a-z-]+(?:-[a-zA-Z0-9._-]+)?)\.json$/.test(name))
-      .map((name) => join(STATE_DIR, name));
+      .map((name) => join(getStateDir(), name));
   } catch {
     files = [];
   }
 
-  return Array.from(new Set([...files, STATE_FILE, currentHarnessStateFile()].filter(Boolean) as string[]));
+  return Array.from(new Set([...files, getStateFile(), currentHarnessStateFile()].filter(Boolean) as string[]));
 }
 
 export async function readMergedState(): Promise<AgentRoomState> {
@@ -341,7 +349,7 @@ export async function reapStaleStateFiles(now = Date.now()): Promise<number> {
   if (process.env.AGENT_ROOM_STATE_FILE) return 0;
   let entries: string[];
   try {
-    entries = await fs.readdir(STATE_DIR);
+    entries = await fs.readdir(getStateDir());
   } catch {
     return 0;
   }
@@ -350,8 +358,8 @@ export async function reapStaleStateFiles(now = Date.now()): Promise<number> {
   for (const name of entries) {
     const match = /^state-(\d+)\.json$/.exec(name);
     if (!match) continue;
-    const file = join(STATE_DIR, name);
-    if (file === STATE_FILE) continue;
+    const file = join(getStateDir(), name);
+    if (file === getStateFile()) continue;
     if (pidIsAlive(Number(match[1]))) continue;
     try {
       const stat = await fs.stat(file);
@@ -377,7 +385,7 @@ function reapStaleStateFilesOnce(): void {
 }
 
 async function writeState(state: AgentRoomState): Promise<void> {
-  await writeStateFile(STATE_FILE, state);
+  await writeStateFile(getStateFile(), state);
   const harnessFile = currentHarnessStateFile();
   if (harnessFile) await writeStateFile(harnessFile, state);
   reapStaleStateFilesOnce();
@@ -393,21 +401,24 @@ async function writeState(state: AgentRoomState): Promise<void> {
 // on every platform, so an empty lock directory is the mutex; a stale lock
 // (holder crashed) is stolen after LOCK_STALE_MS — hook processes live for
 // seconds, so 5s is generous.
-const LOCK_DIR = join(STATE_DIR, '.state-lock');
+function getLockDir(): string {
+  return join(getStateDir(), '.state-lock');
+}
 const LOCK_STALE_MS = 5_000;
 const LOCK_RETRY_MS = 25;
 const LOCK_MAX_TRIES = 40; // ~1s worst case, then proceed unlocked
 
 async function acquireStateLock(): Promise<boolean> {
+  const lockDir = getLockDir();
   for (let i = 0; i < LOCK_MAX_TRIES; i++) {
     try {
-      await fs.mkdir(LOCK_DIR);
+      await fs.mkdir(lockDir);
       return true;
     } catch {
       try {
-        const st = await fs.stat(LOCK_DIR);
+        const st = await fs.stat(lockDir);
         if (Date.now() - st.mtimeMs > LOCK_STALE_MS) {
-          await fs.rmdir(LOCK_DIR).catch(() => { /* raced another stealer */ });
+          await fs.rmdir(lockDir).catch(() => { /* raced another stealer */ });
           continue;
         }
       } catch {
@@ -422,12 +433,12 @@ async function acquireStateLock(): Promise<boolean> {
 }
 
 async function withStateLock<T>(fn: () => Promise<T>): Promise<T> {
-  await fs.mkdir(STATE_DIR, { recursive: true }).catch(() => { /* readState handles missing dir */ });
+  await fs.mkdir(getStateDir(), { recursive: true }).catch(() => { /* readState handles missing dir */ });
   const locked = await acquireStateLock();
   try {
     return await fn();
   } finally {
-    if (locked) await fs.rmdir(LOCK_DIR).catch(() => { /* already released */ });
+    if (locked) await fs.rmdir(getLockDir()).catch(() => { /* already released */ });
   }
 }
 
@@ -587,3 +598,98 @@ export async function claimRoomSessionEverywhere(
     return ok;
   });
 }
+
+// ---- Local cursor handoff (M0 / M5) ----------------------------------------
+
+export interface HandoffRecord {
+  code: string;
+  name: string;
+  cursor: number;
+  seatKey?: string;
+  sessionId?: string;
+  at: number;
+}
+
+export function handoffFilePath(code?: string): string {
+  if (process.env.AGENT_ROOM_HANDOFF_FILE) return process.env.AGENT_ROOM_HANDOFF_FILE;
+  if (code) return join(getStateDir(), `handoff-${code}.json`);
+  return join(getStateDir(), 'handoff.json');
+}
+
+export async function writeHandoff(record: HandoffRecord): Promise<void> {
+  const dir = getStateDir();
+  await fs.mkdir(dir, { recursive: true }).catch(() => {});
+  const data = JSON.stringify(record, null, 2);
+
+  // 1. Write per-room handoff file (e.g. handoff-ABC-123-XYZ.json)
+  const roomFile = join(dir, `handoff-${record.code}.json`);
+  const roomTmp = roomFile + '.tmp';
+  await fs.writeFile(roomTmp, data, { encoding: 'utf8', mode: 0o600 });
+  await fs.rename(roomTmp, roomFile);
+
+  // 2. Also write/update general handoff.json
+  const mainFile = join(dir, 'handoff.json');
+  let mainState: { version: 1; handoffs: Record<string, HandoffRecord>; latest?: HandoffRecord } = {
+    version: 1,
+    handoffs: {},
+  };
+  try {
+    const raw = await fs.readFile(mainFile, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      mainState = {
+        version: 1,
+        handoffs: parsed.handoffs && typeof parsed.handoffs === 'object' ? parsed.handoffs : {},
+      };
+    }
+  } catch {
+    // initialize fresh
+  }
+  mainState.handoffs[record.code] = record;
+  mainState.latest = record;
+
+  const combined = {
+    ...mainState,
+    code: record.code,
+    name: record.name,
+    cursor: record.cursor,
+    seatKey: record.seatKey,
+    sessionId: record.sessionId,
+    at: record.at,
+  };
+  const mainTmp = mainFile + '.tmp';
+  await fs.writeFile(mainTmp, JSON.stringify(combined, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await fs.rename(mainTmp, mainFile);
+
+  // 3. If AGENT_ROOM_HANDOFF_FILE is explicitly set in env, write to it as well
+  if (process.env.AGENT_ROOM_HANDOFF_FILE) {
+    const customFile = process.env.AGENT_ROOM_HANDOFF_FILE;
+    await fs.mkdir(dirname(customFile), { recursive: true }).catch(() => {});
+    const customTmp = customFile + '.tmp';
+    await fs.writeFile(customTmp, data, { encoding: 'utf8', mode: 0o600 });
+    await fs.rename(customTmp, customFile);
+  }
+}
+
+export async function readHandoff(code?: string): Promise<HandoffRecord | null> {
+  const target = handoffFilePath(code);
+  try {
+    const raw = await fs.readFile(target, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      if (typeof parsed.cursor === 'number' && typeof parsed.code === 'string') {
+        return parsed as HandoffRecord;
+      }
+      if (code && parsed.handoffs && parsed.handoffs[code]) {
+        return parsed.handoffs[code] as HandoffRecord;
+      }
+      if (parsed.latest) {
+        return parsed.latest as HandoffRecord;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+

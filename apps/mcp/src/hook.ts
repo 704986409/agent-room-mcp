@@ -1,5 +1,6 @@
-import { createRoomApiClient, getMessages, getRoom } from './roomApi.js';
+import { createRoomApiClient, getMessages, getRoom, roomSleep } from './roomApi.js';
 import type { Message } from '@agent-room/shared';
+import { mentionedAgents } from '@agent-room/shared';
 import { readFile } from 'node:fs/promises';
 import {
   readState,
@@ -16,6 +17,8 @@ import {
   removeRoomEverywhere,
   claimRoomSessionEverywhere,
   roomBelongsToSession,
+  writeHandoff,
+  readHandoff,
 } from './state.js';
 import { detectHarness } from './harness.js';
 
@@ -24,8 +27,14 @@ import { detectHarness } from './harness.js';
 // 8s to a full 30s so the hook + the agent's room_listen window line up —
 // without this, an agent that finished a turn without a recent send would
 // only get an 8-second window to catch a web user's reply before sleeping.
-const POLL_MAX_MS = 30_000;
-const POLL_INTERVAL_MS = 1_500;
+const getPollMaxMs = () => {
+  const fromEnv = parseInt(process.env.AGENT_ROOM_HOOK_POLL_MAX_MS ?? '', 10);
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 30_000;
+};
+const getPollIntervalMs = () => {
+  const fromEnv = parseInt(process.env.AGENT_ROOM_HOOK_POLL_INTERVAL_MS ?? '', 10);
+  return Number.isFinite(fromEnv) && fromEnv > 0 ? fromEnv : 1_500;
+};
 
 // Stop hooks are a fallback for clients that accidentally finish their turn
 // while they are still in a room. Each continuation starts another model turn,
@@ -162,12 +171,13 @@ async function emitStopContinuation(
   cursorMode: boolean,
   scope: StateScope,
   delivered: boolean,
+  writeStdout: (data: string) => void = (d) => process.stdout.write(d),
 ): Promise<void> {
   if (delivered) {
     try { await resetStopContinuationBudget(scope); }
     catch { /* non-essential */ }
-    if (cursorMode) process.stdout.write(JSON.stringify({ followup_message: text }));
-    else process.stdout.write(JSON.stringify({ decision: 'block', reason: text }));
+    if (cursorMode) writeStdout(JSON.stringify({ followup_message: text }));
+    else writeStdout(JSON.stringify({ decision: 'block', reason: text }));
     return;
   }
   let budget: StopContinuationBudget;
@@ -186,11 +196,73 @@ async function emitStopContinuation(
   if (budget.decision === 'allow') {
     // Omitting decision/followup is the documented allow shape. systemMessage
     // makes the reason visible without scheduling another model turn.
-    process.stdout.write(JSON.stringify({ systemMessage: budget.reason }));
+    writeStdout(JSON.stringify({ systemMessage: budget.reason }));
     return;
   }
-  if (cursorMode) process.stdout.write(JSON.stringify({ followup_message: text }));
-  else process.stdout.write(JSON.stringify({ decision: 'block', reason: text }));
+  if (cursorMode) writeStdout(JSON.stringify({ followup_message: text }));
+  else writeStdout(JSON.stringify({ decision: 'block', reason: text }));
+}
+
+/**
+ * Returns true if the message addresses the specified agent.
+ * Checks for `@name` (case-insensitive) or `metadata.targetAgentName`.
+ */
+export function messageMentionsAgent(m: Message, agentName: string): boolean {
+  if (!agentName) return false;
+  if (m.metadata?.targetAgentName) {
+    if (
+      m.metadata.targetAgentName === agentName ||
+      m.metadata.targetAgentName.toLowerCase() === agentName.toLowerCase()
+    ) {
+      return true;
+    }
+  }
+  const names = [agentName];
+  const baseMatch = agentName.match(/^(.+?)\s*\(\d+\)$/);
+  if (baseMatch && baseMatch[1]) {
+    names.push(baseMatch[1]);
+  }
+  return mentionedAgents(m.text, names).length > 0;
+}
+
+/**
+ * Perform cursor handoff for a room:
+ * 1. Calls room_sleep API on server if available.
+ * 2. Writes cursor to the local handoff file.
+ */
+export async function performHandoff(
+  client: ReturnType<typeof createRoomApiClient>,
+  input: {
+    code: string;
+    name: string;
+    cursor: number;
+    seatKey?: string;
+    sessionId?: string;
+  },
+): Promise<void> {
+  try {
+    await roomSleep(client, {
+      code: input.code,
+      name: input.name,
+      cursor: input.cursor,
+      seatKey: input.seatKey,
+    });
+  } catch {
+    // server-side roomSleep is best-effort
+  }
+
+  try {
+    await writeHandoff({
+      code: input.code,
+      name: input.name,
+      cursor: input.cursor,
+      seatKey: input.seatKey,
+      sessionId: input.sessionId,
+      at: Date.now(),
+    });
+  } catch {
+    // non-essential local write error
+  }
 }
 
 async function readHookState(scope: StateScope) {
@@ -442,8 +514,16 @@ async function readStdin(): Promise<HookInput> {
   });
 }
 
-export async function runHook(): Promise<void> {
-  const input = await readStdin();
+export interface RunHookIO {
+  stdout?: (data: string) => void;
+  exit?: (code: number) => void;
+}
+
+export async function runHook(testInput?: HookInput, io?: RunHookIO): Promise<void> {
+  const writeStdout = io?.stdout ?? ((d: string) => process.stdout.write(d));
+  const exitProcess = io?.exit ?? ((code: number) => process.exit(code));
+
+  const input = testInput ?? (await readStdin());
   // Normalize the event name across clients. Cursor only fires the stop
   // hook (no UserPromptSubmit / SessionStart equivalent today). Older
   // Cursor hook docs/examples showed `{ status, loop_count }` without a
@@ -456,7 +536,8 @@ export async function runHook(): Promise<void> {
   // long-polls; now we only act when we actually got an event.
   const classified = classifyHookInput(input);
   if (!classified) {
-    process.exit(0);
+    exitProcess(0);
+    return;
   }
   const { event, cursorMode } = classified;
   const sessionKey = resolveHookSessionKey(input);
@@ -494,143 +575,199 @@ export async function runHook(): Promise<void> {
   try { await recoverRoomsFromTranscript(stateScope, input.transcript_path, sessionKey); }
   catch { /* non-essential */ }
 
+  const isManaged = process.env.AGENT_ROOM_MANAGED === '1';
+
+  // Daemon-managed session: NEVER auto-continue under any circumstances.
+  // Hand off cursors for active rooms and exit.
+  if (event === 'Stop' && isManaged) {
+    try {
+      let pending: PendingRoom[] = [];
+      try {
+        pending = await fetchPending(stateScope, sessionKey);
+        await commitCursors(pending, stateScope);
+      } catch { /* ignore */ }
+
+      const state = await readHookState(stateScope);
+      const client = createRoomApiClient();
+      for (const [code, r] of Object.entries(state.rooms)) {
+        if (!roomBelongsToSession(r, sessionKey)) continue;
+        await performHandoff(client, {
+          code,
+          name: r.name,
+          cursor: r.cursor,
+          seatKey: r.seatKey,
+          sessionId: r.sessionKey ?? sessionKey,
+        });
+      }
+      await resetStopContinuationBudget(stateScope);
+    } catch { /* best-effort handoff before exit */ }
+    exitProcess(0);
+    return;
+  }
+
   let pending: PendingRoom[];
   try {
     pending = await fetchPending(stateScope, sessionKey);
   } catch {
     try { await resetStopContinuationBudget(stateScope); }
     catch { /* non-essential */ }
-    process.exit(0);
+    exitProcess(0);
+    return;
   }
 
-  let withMessages = pending.filter((r) => r.messages.length > 0);
   await commitCursors(pending, stateScope); // advance cursors even when only own-messages were skipped
 
-  // Long-poll fallback (Fix A): on Stop, if there's any active room at all,
-  // hold the turn open and watch for incoming messages. This used to fire
-  // ONLY when the agent had recently sent a message, leaving a death zone
-  // where a passively-listening agent would sleep instantly the moment its
-  // turn ended — and any later web user reply would be missed.
-  if (withMessages.length === 0 && event === 'Stop') {
+  const withAnyMessages = pending.filter((r) => r.messages.length > 0);
+  let hasMention = withAnyMessages.some((r) =>
+    r.messages.some((m) => messageMentionsAgent(m, r.selfName))
+  );
+
+  let accumulatedRooms: PendingRoom[] = [...withAnyMessages];
+
+  // Stop hook: listen exactly one round (the long-poll window) if no @ arrived yet:
+  if (!hasMention && event === 'Stop') {
     const state = await readHookState(stateScope);
     const hasActiveRoom = Object.values(state.rooms).some((r) => roomBelongsToSession(r, sessionKey));
     if (hasActiveRoom) {
-      const deadline = Date.now() + POLL_MAX_MS;
-      // Ease 1.5s -> 5s across the window: the first replies usually land
-      // fast; past ~10s of quiet, finer granularity is pure API load (this
-      // loop runs on every Stop while the room remains active).
-      let pollDelay = POLL_INTERVAL_MS;
+      const deadline = Date.now() + getPollMaxMs();
+      let pollDelay = getPollIntervalMs();
       while (Date.now() < deadline) {
         await sleep(pollDelay);
         pollDelay = Math.min(Math.floor(pollDelay * 1.5), 5_000);
         let p: PendingRoom[];
         try { p = await fetchPending(stateScope, sessionKey); }
         catch { break; }
-        const got = p.filter((r) => r.messages.length > 0);
         await commitCursors(p, stateScope);
-        if (got.length > 0) { withMessages = got; break; }
+        const got = p.filter((r) => r.messages.length > 0);
+        if (got.length > 0) {
+          for (const newRoom of got) {
+            const existing = accumulatedRooms.find((r) => r.code === newRoom.code);
+            if (existing) {
+              existing.messages.push(...newRoom.messages);
+              existing.newCursor = newRoom.newCursor;
+            } else {
+              accumulatedRooms.push(newRoom);
+            }
+          }
+          if (accumulatedRooms.some((r) => r.messages.some((m) => messageMentionsAgent(m, r.selfName)))) {
+            hasMention = true;
+            break;
+          }
+        }
       }
     }
   }
 
-  // Fix A continued: if we got messages, deliver them and keep the room turn
-  // alive so the agent replies and immediately resumes listening.
-  if (withMessages.length > 0 && event === 'Stop') {
-    const text = formatMessages(withMessages);
-    await emitStopContinuation(text, cursorMode, stateScope, true);
-    process.exit(0);
+  // If messages addressing this agent arrived, deliver them and keep the room turn alive
+  if (hasMention && event === 'Stop') {
+    const text = formatMessages(accumulatedRooms);
+    await emitStopContinuation(text, cursorMode, stateScope, true, writeStdout);
+    exitProcess(0);
+    return;
   }
 
-  // Fix A + B: still no messages, but there are active rooms. Force the
-  // agent to call room_listen again instead of letting it sleep silently.
-  // The continuation budget above is a last-resort fuse for a malfunctioning
-  // client/rule. Normal presence remains the long-running room_listen call.
-  if (withMessages.length === 0 && event === 'Stop') {
-    let activeRooms: Array<{ code: string; topic: string; selfName: string; cursor: number }> = [];
-    try {
-      const state = await readHookState(stateScope);
-      const apiClient = createRoomApiClient();
-      // Best-effort cleanup: drop rooms from local state that are gone
-      // server-side (TTL expired) or marked ended, or where this agent is
-      // no longer in the participants list. Without this, a left-over
-      // entry would keep the Stop hook looping "call room_listen" forever
-      // after the meeting closes — Codex caught this in 0.12.0 review.
-      for (const [code, r] of Object.entries(state.rooms)) {
-        if (!roomBelongsToSession(r, sessionKey)) continue;
-        if (sessionKey && !r.sessionKey) {
-          const claimed = await claimRoomSessionEverywhere(code, sessionKey);
-          if (!claimed) continue;
-          r.sessionKey = sessionKey;
-        }
-        try {
-          const room = await getRoom(apiClient, code);
-          const stillIn = room.participants.some(p => p.name === r.name && p.client === 'cc');
-          if (room.status !== 'active' || !stillIn) {
+  // If NO @ for this agent arrived after the listen round:
+  if (!hasMention && event === 'Stop') {
+    // Check if user explicitly disabled idle sleep (manual sessions opting out of sleep)
+    const idleSleepEnabled = process.env.AGENT_ROOM_IDLE_SLEEP !== '0' && process.env.AGENT_ROOM_IDLE_SLEEP !== 'false';
+    if (!idleSleepEnabled) {
+      // Keep legacy active room contract loop if explicitly configured
+      let activeRooms: Array<{ code: string; topic: string; selfName: string; cursor: number }> = [];
+      try {
+        const state = await readHookState(stateScope);
+        const apiClient = createRoomApiClient();
+        for (const [code, r] of Object.entries(state.rooms)) {
+          if (!roomBelongsToSession(r, sessionKey)) continue;
+          if (sessionKey && !r.sessionKey) {
+            const claimed = await claimRoomSessionEverywhere(code, sessionKey);
+            if (!claimed) continue;
+            r.sessionKey = sessionKey;
+          }
+          try {
+            const room = await getRoom(apiClient, code);
+            const stillIn = room.participants.some(p => p.name === r.name && p.client === 'cc');
+            if (room.status !== 'active' || !stillIn) {
+              try {
+                if (stateScope === 'harness') await removeRoomEverywhere(code);
+                else await removeRoom(code);
+              } catch { /* non-essential */ }
+              continue;
+            }
+            activeRooms.push({ code, topic: room.topic, selfName: r.name, cursor: r.cursor });
+          } catch {
             try {
               if (stateScope === 'harness') await removeRoomEverywhere(code);
               else await removeRoom(code);
             } catch { /* non-essential */ }
-            continue;
           }
-          activeRooms.push({ code, topic: room.topic, selfName: r.name, cursor: r.cursor });
-        } catch {
-          // Room not found / TTL expired — drop it from state too.
-          try {
-            if (stateScope === 'harness') await removeRoomEverywhere(code);
-            else await removeRoom(code);
-          } catch { /* non-essential */ }
         }
-      }
-    } catch { /* fall through to plain exit */ }
+      } catch { /* fall through */ }
 
-    if (activeRooms.length > 0) {
-      const lines: string[] = [];
-      lines.push('[agent-room] No new messages during the long-poll, but you are still in an active room.');
-      lines.push('');
-      lines.push('ACTIVE ROOM CONTRACT applies.');
-      lines.push('');
-      lines.push('Call room_listen NOW to stay present. Do NOT call any other tool, do NOT give a final answer, do NOT give a status update, and do NOT end your turn. Silence is normal during pauses; the conversation may resume any moment.');
-      lines.push('');
-      for (const r of activeRooms) {
-        lines.push(`  • room_listen({ code: "${r.code}", since: ${r.cursor} })  // joined as "${r.selfName}"`);
+      if (activeRooms.length > 0) {
+        const lines: string[] = [];
+        lines.push('[agent-room] No new messages during the long-poll, but you are still in an active room.');
+        lines.push('');
+        lines.push('ACTIVE ROOM CONTRACT applies.');
+        lines.push('');
+        lines.push('Call room_listen NOW to stay present. Do NOT call any other tool, do NOT give a final answer, do NOT give a status update, and do NOT end your turn. Silence is normal during pauses; the conversation may resume any moment.');
+        lines.push('');
+        for (const r of activeRooms) {
+          lines.push(`  • room_listen({ code: "${r.code}", since: ${r.cursor} })  // joined as "${r.selfName}"`);
+        }
+        lines.push('');
+        lines.push('After the listen returns, decide: reply with room_send (and queue another room_listen), or call room_listen again to keep waiting. A completed task, status summary, or final answer is NOT a valid reason to stop. The only valid reasons to stop are: room ended, you were removed from participants, or the host explicitly said you can leave.');
+        const text = lines.join('\n');
+        await emitStopContinuation(text, cursorMode, stateScope, false, writeStdout);
+        exitProcess(0);
+        return;
       }
-      lines.push('');
-      lines.push('After the listen returns, decide: reply with room_send (and queue another room_listen), or call room_listen again to keep waiting. A completed task, status summary, or final answer is NOT a valid reason to stop. The only valid reasons to stop are: room ended, you were removed from participants, or the host explicitly said you can leave.');
-      const text = lines.join('\n');
-      await emitStopContinuation(text, cursorMode, stateScope, false);
-      process.exit(0);
     }
-    // No active rooms remain (ended, removed, or expired): this Stop is
-    // allowed, so do not carry its streak into a future room session.
-    try { await resetStopContinuationBudget(stateScope); }
-    catch { /* non-essential */ }
-    process.exit(0);
+
+    // Default: hand off cursor and exit, do NOT resume session
+    try {
+      const state = await readHookState(stateScope);
+      const client = createRoomApiClient();
+      for (const [code, r] of Object.entries(state.rooms)) {
+        if (!roomBelongsToSession(r, sessionKey)) continue;
+        await performHandoff(client, {
+          code,
+          name: r.name,
+          cursor: r.cursor,
+          seatKey: r.seatKey,
+          sessionId: r.sessionKey ?? sessionKey,
+        });
+      }
+      await resetStopContinuationBudget(stateScope);
+    } catch { /* best-effort handoff before exit */ }
+    exitProcess(0);
+    return;
   }
 
-  if (withMessages.length === 0) {
+  if (withAnyMessages.length === 0) {
     try { await resetStopContinuationBudget(stateScope); }
     catch { /* non-essential */ }
-    process.exit(0);
+    exitProcess(0);
+    return;
   }
 
-  const text = formatMessages(withMessages);
+  const text = formatMessages(withAnyMessages);
 
   if (event === 'UserPromptSubmit') {
-    process.stdout.write(JSON.stringify({
+    writeStdout(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'UserPromptSubmit',
         additionalContext: text,
       },
     }));
   } else if (event === 'SessionStart') {
-    process.stdout.write(JSON.stringify({
+    writeStdout(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: 'SessionStart',
         additionalContext: text,
       },
     }));
   } else {
-    process.stdout.write(text);
+    writeStdout(text);
   }
-  process.exit(0);
+  exitProcess(0);
 }

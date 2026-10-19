@@ -38,6 +38,7 @@ import {
   NotHostError,
   InvalidModeConfigError,
   ModeNotSupportedError,
+  roomSleep,
   type RoomApiClient,
 } from './roomApi.js';
 import { getMessagesResilient } from './getMessagesResilient.js';
@@ -52,7 +53,7 @@ import type {
   Room,
   TaskBoard,
 } from '@agent-room/shared';
-import { setRoom, removeRoom, updateCursor, updateGameVersion, markSent, readState, readRoomStateForJoin } from './state.js';
+import { setRoom, removeRoom, updateCursor, updateGameVersion, markSent, readState, readRoomStateForJoin, writeHandoff } from './state.js';
 import {
   detectHarness,
   harnessRunId,
@@ -1038,7 +1039,7 @@ export function registerTools(server: Server) {
       if (parsed) a.code = parsed;
     }
 
-    if (activeProfile === 'core' && !CORE_PROFILE_TOOLS.has(CANONICAL_NAME[name] ?? name)) {
+    if (name !== 'room_sleep' && activeProfile === 'core' && !CORE_PROFILE_TOOLS.has(CANONICAL_NAME[name] ?? name)) {
       return ok({
         error: 'unknown_tool',
         hint:
@@ -1661,6 +1662,47 @@ export function registerTools(server: Server) {
         left: true,
         code: a.code,
         hint: 'Left the room. Stop hook will no longer block on this room. If you also want to acknowledge the host before leaving, call room_send first, then room_leave.',
+      });
+    }
+
+    if (name === 'room_sleep') {
+      const code = a.code;
+      let selfName: string = typeof a.name === 'string' && a.name.trim() ? a.name.trim() : '';
+      let room: import('./state.js').RoomState | undefined;
+      try {
+        const state = await readState();
+        room = state.rooms[code];
+      } catch { /* state unavailable */ }
+      if (!selfName && room?.name) {
+        selfName = room.name;
+      }
+      const cursor = typeof a.cursor === 'number' ? a.cursor : room?.cursor ?? 0;
+      try {
+        await roomSleep(client, {
+          code,
+          name: selfName,
+          cursor,
+          seatKey: room?.seatKey,
+        });
+      } catch { /* server sleep call is best-effort */ }
+
+      await writeHandoff({
+        code,
+        name: selfName,
+        cursor,
+        seatKey: room?.seatKey,
+        sessionId: room?.sessionKey,
+        at: Date.now(),
+      });
+      if (cursor > (room?.cursor ?? 0)) {
+        await updateCursor(code, cursor);
+      }
+      return ok({
+        status: 'sleeping',
+        code,
+        name: selfName,
+        cursor,
+        hint: 'Cursor handed off. Session is entering sleep state.',
       });
     }
 
