@@ -59,6 +59,101 @@ const HOOK_COMMAND = 'npx -y agent-room-mcp hook';
 const HOOK_EVENTS = ['Stop', 'UserPromptSubmit', 'SessionStart'] as const;
 
 /**
+ * Desktop bundles this fork and sets these before `init` so every client
+ * config launches that Node + entry, not the public npm package.
+ * Both must be set; either alone is an error. Unset keeps `npx -y agent-room-mcp`.
+ *   AGENT_ROOM_MCP_COMMAND  absolute path to node
+ *   AGENT_ROOM_MCP_ARGS     JSON array, e.g. ["C:\\...\\resources\\mcp\\dist\\index.js"]
+ */
+export function stripWin32VerbatimPrefix(path: string): string {
+  if (!path.startsWith('\\\\?\\')) return path;
+  const rest = path.slice(4);
+  if (!rest) return path;
+  if (rest.toUpperCase().startsWith('UNC\\')) {
+    const unc = rest.slice(4);
+    return unc ? `\\\\${unc}` : path;
+  }
+  return rest;
+}
+
+export function resolveMcpLaunch(env: NodeJS.ProcessEnv = process.env): { command: string; args: string[] } {
+  const command = env.AGENT_ROOM_MCP_COMMAND?.trim() ?? '';
+  const rawArgs = env.AGENT_ROOM_MCP_ARGS?.trim() ?? '';
+  if (!command && !rawArgs) {
+    return { command: MCP_ENTRY.command, args: [...MCP_ENTRY.args] };
+  }
+  if (!command || !rawArgs) {
+    throw new Error('AGENT_ROOM_MCP_COMMAND and AGENT_ROOM_MCP_ARGS must be set together');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawArgs);
+  } catch {
+    throw new Error('AGENT_ROOM_MCP_ARGS must be a JSON array of strings');
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0 || !parsed.every((item) => typeof item === 'string')) {
+    throw new Error('AGENT_ROOM_MCP_ARGS must be a JSON array of strings');
+  }
+  return {
+    command: stripWin32VerbatimPrefix(command),
+    args: parsed.map((item) => stripWin32VerbatimPrefix(item)),
+  };
+}
+
+function isDefaultLaunch(launch: { command: string; args: string[] }): boolean {
+  return launch.command === MCP_ENTRY.command
+    && launch.args.length === MCP_ENTRY.args.length
+    && launch.args.every((arg, index) => arg === MCP_ENTRY.args[index]);
+}
+
+/** Quote one argv element for a hook command (POSIX sh, or cmd.exe on Windows). */
+export function shellQuoteArg(arg: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'win32') {
+    if (arg.length === 0) return '""';
+    if (!/[\s"&|<>^%]/.test(arg)) return arg;
+    return `"${arg.replace(/"/g, '\\"')}"`;
+  }
+  if (arg.length === 0) return "''";
+  if (/^[A-Za-z0-9_./:=@+-]+$/.test(arg)) return arg;
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+export function hookCommand(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const launch = resolveMcpLaunch(env);
+  if (isDefaultLaunch(launch)) return HOOK_COMMAND;
+  return [shellQuoteArg(launch.command, platform), ...launch.args.map((arg) => shellQuoteArg(arg, platform)), 'hook'].join(' ');
+}
+
+function tomlBasicString(value: string): string {
+  const escaped = value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t');
+  return `"${escaped}"`;
+}
+
+/** Basic TOML string, or a literal string when the value contains `\` or `"`. */
+export function tomlQuoted(value: string): string {
+  if (!value.includes("'") && /[\\"\n\r\t]/.test(value)) return `'${value}'`;
+  return tomlBasicString(value);
+}
+
+function codexMcpServerBlock(env: NodeJS.ProcessEnv = process.env): string {
+  const launch = resolveMcpLaunch(env);
+  const args = launch.args.map((arg) => tomlQuoted(arg)).join(', ');
+  return `[mcp_servers.agent-room]\ncommand = ${tomlQuoted(launch.command)}\nargs = [${args}]\n`;
+}
+
+function isAgentRoomHookCommand(command: string): boolean {
+  return /(?:agent-room-mcp|mcp[\\/]+dist[\\/]+index\.js)\b[\s\S]*\bhook\b/.test(command);
+}
+
+/**
  * Matches a TOML `command = "..."` line for ANY spelling of the agent-room hook.
  *
  * The "have we installed this already?" check used to be an exact substring
@@ -68,9 +163,10 @@ const HOOK_EVENTS = ['Stop', 'UserPromptSubmit', 'SessionStart'] as const;
  * `init` did not recognise it, and appended a full second set of Stop /
  * UserPromptSubmit / SessionStart blocks — so every Stop ran the hook twice.
  * Recognise the hook by what it invokes, not by how it was spelled.
+ * Bundled installs quote `resources/mcp/dist/index.js` instead of `agent-room-mcp`.
  */
 const HOOK_COMMAND_LINE_RE =
-  /^[ \t]*command[ \t]*=[ \t]*"[^"\n]*agent-room-mcp[^"\n]*\bhook\b[^"\n]*"[ \t]*$/gm;
+  /^[ \t]*command[ \t]*=[ \t]*(?:"(?:\\.|[^"\n])*(?:agent-room-mcp|mcp[\\/]+dist[\\/]+index\.js)(?:\\.|[^"\n])*\bhook\b(?:\\.|[^"\n])*"|'(?:[^'\n])*(?:agent-room-mcp|mcp[\\/]+dist[\\/]+index\.js)(?:[^'\n])*\bhook\b(?:[^'\n])*')[ \t]*$/gm;
 
 export function countInstalledCodexHookCommands(toml: string): number {
   return toml.match(HOOK_COMMAND_LINE_RE)?.length ?? 0;
@@ -251,13 +347,22 @@ async function writeJsonAtomic(path: string, data: unknown): Promise<void> {
 
 function ensureHookEntry(arr: unknown, command: string): unknown[] {
   const list = Array.isArray(arr) ? [...arr] : [];
-  const exists = list.some((group: any) =>
-    Array.isArray(group?.hooks) &&
-    group.hooks.some((h: any) => h?.command === command)
-  );
-  if (exists) return list;
-  list.push({ hooks: [{ type: 'command', command }] });
-  return list;
+  let found = false;
+  const next = list.map((group: any) => {
+    if (!group || !Array.isArray(group.hooks)) return group;
+    let changed = false;
+    const hooks = group.hooks.map((hook: any) => {
+      if (!isAgentRoomHookCommand(String(hook?.command ?? ''))) return hook;
+      found = true;
+      if (hook.command === command) return hook;
+      changed = true;
+      return { ...hook, command };
+    });
+    return changed ? { ...group, hooks } : group;
+  });
+  if (found) return next;
+  next.push({ hooks: [{ type: 'command', command }] });
+  return next;
 }
 
 interface InstallResult {
@@ -290,16 +395,21 @@ async function pathExists(path: string): Promise<boolean> {
 }
 
 function tryClaudeMcpAdd(claudeBin: string): Promise<boolean> {
-  // `claude mcp add --scope user agent-room -- npx -y agent-room-mcp`
+  // `claude mcp add --scope user agent-room -- <command> <args…>`
   // Lets Claude Code's own CLI write the registration in whatever location
   // / format the installed version prefers. Falls back silently on error.
   // On Windows with shell:true, pass the bare command name so paths with spaces
   // (e.g. C:\Users\Robin Zhang\...\claude.cmd) are not split by the shell.
+  // Bundled node/script paths are quoted for that same shell.
+  const launch = resolveMcpLaunch();
   const command = process.platform === 'win32' ? 'claude' : claudeBin;
+  const mcpArgs = [launch.command, ...launch.args].map((arg) =>
+    process.platform === 'win32' ? shellQuoteArg(arg, 'win32') : arg
+  );
   return new Promise((resolve) => {
     const p = spawn(
       command,
-      ['mcp', 'add', '--scope', 'user', 'agent-room', '--', 'npx', '-y', 'agent-room-mcp'],
+      ['mcp', 'add', '--scope', 'user', 'agent-room', '--', ...mcpArgs],
       { stdio: 'ignore', shell: process.platform === 'win32' }
     );
     p.on('close', (code) => resolve(code === 0));
@@ -329,7 +439,7 @@ async function installClaudeCode(opts: { hooks: boolean }): Promise<InstallResul
   const mcp = (await readJson(mcpPath)) ?? {};
   const servers = ((mcp.mcpServers as Record<string, unknown>) ?? {});
   const before = JSON.stringify(servers['agent-room']);
-  servers['agent-room'] = CLAUDE_CODE_MCP_ENTRY;
+  servers['agent-room'] = { ...resolveMcpLaunch(), env: CLAUDE_CODE_MCP_ENTRY.env };
   mcp.mcpServers = servers;
   if (JSON.stringify(servers['agent-room']) !== before) {
     await writeJsonAtomic(mcpPath, mcp);
@@ -358,7 +468,7 @@ async function installClaudeCode(opts: { hooks: boolean }): Promise<InstallResul
     let changed = false;
     for (const event of HOOK_EVENTS) {
       const before = JSON.stringify(hooks[event] ?? []);
-      hooks[event] = ensureHookEntry(hooks[event], HOOK_COMMAND);
+      hooks[event] = ensureHookEntry(hooks[event], hookCommand());
       if (JSON.stringify(hooks[event]) !== before) changed = true;
     }
     settings.hooks = hooks;
@@ -508,7 +618,7 @@ async function installClaude(opts: { hooks: boolean }): Promise<InstallResult> {
   const config = (await readJson(path)) ?? {};
   const servers = ((config.mcpServers as Record<string, unknown>) ?? {});
   const before = JSON.stringify(servers['agent-room']);
-  servers['agent-room'] = CLAUDE_DESKTOP_MCP_ENTRY;
+  servers['agent-room'] = { ...resolveMcpLaunch(), env: CLAUDE_DESKTOP_MCP_ENTRY.env };
   config.mcpServers = servers;
 
   if (JSON.stringify(servers['agent-room']) !== before) {
@@ -539,7 +649,7 @@ async function installCursor(opts: { hooks: boolean }): Promise<InstallResult> {
   const data = (await readJson(mcpPath)) ?? {};
   const servers = ((data.mcpServers as Record<string, unknown>) ?? {});
   const beforeServers = JSON.stringify(servers['agent-room']);
-  servers['agent-room'] = MCP_ENTRY;
+  servers['agent-room'] = resolveMcpLaunch();
   data.mcpServers = servers;
   if (JSON.stringify(servers['agent-room']) !== beforeServers) {
     await writeJsonAtomic(mcpPath, data);
@@ -562,9 +672,16 @@ async function installCursor(opts: { hooks: boolean }): Promise<InstallResult> {
     const existing = (await readJson(hooksPath)) ?? {};
     const hooksObj = ((existing.hooks as Record<string, unknown>) ?? {});
     const stopList = Array.isArray(hooksObj.stop) ? [...(hooksObj.stop as unknown[])] : [];
-    const alreadyInstalled = stopList.some((h: any) => h?.command === HOOK_COMMAND);
+    const command = hookCommand();
+    const existingIndex = stopList.findIndex((h: any) => isAgentRoomHookCommand(String(h?.command ?? '')));
+    const alreadyInstalled = existingIndex >= 0 && (stopList[existingIndex] as { command?: string }).command === command;
     if (!alreadyInstalled) {
-      stopList.push({ command: HOOK_COMMAND, loop_limit: null });
+      if (existingIndex >= 0) {
+        const prev = stopList[existingIndex] as Record<string, unknown>;
+        stopList[existingIndex] = { ...prev, command, loop_limit: null };
+      } else {
+        stopList.push({ command, loop_limit: null });
+      }
       hooksObj.stop = stopList;
       existing.hooks = hooksObj;
       // Cursor docs require `version: 1` at the top level.
@@ -594,7 +711,7 @@ async function installAntigravity(): Promise<InstallResult> {
   const data = (await readJson(path)) ?? {};
   const servers = ((data.mcpServers as Record<string, unknown>) ?? {});
   const before = JSON.stringify(servers['agent-room']);
-  servers['agent-room'] = ANTIGRAVITY_MCP_ENTRY;
+  servers['agent-room'] = { ...resolveMcpLaunch(), env: ANTIGRAVITY_MCP_ENTRY.env };
   data.mcpServers = servers;
   if (JSON.stringify(servers['agent-room']) !== before) {
     await writeJsonAtomic(path, data);
@@ -639,7 +756,7 @@ async function installCline(): Promise<InstallResult> {
   const data = (await readJson(path)) ?? {};
   const servers = ((data.mcpServers as Record<string, unknown>) ?? {});
   const before = JSON.stringify(servers['agent-room']);
-  servers['agent-room'] = MCP_ENTRY;
+  servers['agent-room'] = resolveMcpLaunch();
   data.mcpServers = servers;
   if (JSON.stringify(servers['agent-room']) !== before) {
     await writeJsonAtomic(path, data);
@@ -662,13 +779,24 @@ function vscodeMcpPath(): string {
   return vscodeMcpPathFor(homedir(), process.platform, process.env.APPDATA);
 }
 
+/** VS Code / Copilot keep their npx (and Windows `cmd /c`) shape until a bundle override is set. */
+function stdioClientEntry(packageArgs: string[]): { type: string; command: string; args: string[]; env: { GITHUB_COPILOT: '1' } } {
+  const launch = resolveMcpLaunch();
+  const env = { GITHUB_COPILOT: '1' as const };
+  if (!isDefaultLaunch(launch)) {
+    return { type: 'stdio', command: launch.command, args: launch.args, env };
+  }
+  if (process.platform === 'win32') {
+    return { type: 'stdio', command: 'cmd', args: ['/c', 'npx', ...packageArgs], env };
+  }
+  return { type: 'stdio', command: 'npx', args: packageArgs, env };
+}
+
 async function installVscode(): Promise<InstallResult> {
   const path = vscodeMcpPath();
   const data = (await readJson(path)) ?? {};
   const servers = ((data.servers as Record<string, unknown>) ?? {});
-  const entry = process.platform === 'win32'
-    ? { type: 'stdio', command: 'cmd', args: ['/c', 'npx', '-y', 'agent-room-mcp'], env: { GITHUB_COPILOT: '1' } }
-    : { type: 'stdio', command: 'npx', args: ['-y', 'agent-room-mcp'], env: { GITHUB_COPILOT: '1' } };
+  const entry = stdioClientEntry(['-y', 'agent-room-mcp']);
   const before = JSON.stringify(servers['agent-room']);
   servers['agent-room'] = entry;
   data.servers = servers;
@@ -691,9 +819,7 @@ async function installCopilot(): Promise<InstallResult> {
   const path = copilotMcpConfigPathFor(homedir(), process.env.COPILOT_HOME);
   const data = (await readJson(path)) ?? {};
   const servers = ((data.mcpServers as Record<string, unknown>) ?? {});
-  const entry = process.platform === 'win32'
-    ? { type: 'stdio', command: 'cmd', args: ['/c', 'npx', '-y', 'agent-room-mcp@latest'], env: { GITHUB_COPILOT: '1' } }
-    : { type: 'stdio', command: 'npx', args: ['-y', 'agent-room-mcp@latest'], env: { GITHUB_COPILOT: '1' } };
+  const entry = stdioClientEntry(['-y', 'agent-room-mcp@latest']);
   const before = JSON.stringify(servers['agent-room']);
   servers['agent-room'] = entry;
   data.mcpServers = servers;
@@ -730,7 +856,7 @@ export async function installCodex(opts: { hooks: boolean }): Promise<InstallRes
     result.unchanged.push(`${path} (mcp_servers.agent-room already present)`);
   } else {
     modified = ensureTrailingBlankLine(modified);
-    modified += '[mcp_servers.agent-room]\ncommand = "npx"\nargs = ["-y", "agent-room-mcp"]\n';
+    modified += codexMcpServerBlock();
     result.changes.push(`installed [mcp_servers.agent-room] in ${path}`);
   }
 
@@ -771,7 +897,7 @@ export async function installCodex(opts: { hooks: boolean }): Promise<InstallRes
       for (const event of HOOK_EVENTS) {
         modified = ensureTrailingBlankLine(modified);
         modified += `[[hooks.${event}]]\nmatcher = ""\n`;
-        modified += `[[hooks.${event}.hooks]]\ntype = "command"\ncommand = "${HOOK_COMMAND}"\n`;
+        modified += `[[hooks.${event}.hooks]]\ntype = "command"\ncommand = ${tomlQuoted(hookCommand())}\n`;
       }
       result.changes.push(`installed Stop / UserPromptSubmit / SessionStart hooks in ${path}`);
     }
@@ -809,14 +935,15 @@ function printRulesInstruction(target: string, where: string): void {
 }
 
 function printConfigs() {
-  const mcp = JSON.stringify({ mcpServers: { 'agent-room': MCP_ENTRY } }, null, 2);
+  const hook = hookCommand();
+  const mcp = JSON.stringify({ mcpServers: { 'agent-room': resolveMcpLaunch() } }, null, 2);
   // Both Claude surfaces get the self-identifying entry — a hand-copied config
   // without the marker is the same silent-dropout bug as one written by init.
-  const claudeMcp = JSON.stringify({ mcpServers: { 'agent-room': CLAUDE_CODE_MCP_ENTRY } }, null, 2);
-  const claudeDesktopMcp = JSON.stringify({ mcpServers: { 'agent-room': CLAUDE_DESKTOP_MCP_ENTRY } }, null, 2);
+  const claudeMcp = JSON.stringify({ mcpServers: { 'agent-room': { ...resolveMcpLaunch(), env: CLAUDE_CODE_MCP_ENTRY.env } } }, null, 2);
+  const claudeDesktopMcp = JSON.stringify({ mcpServers: { 'agent-room': { ...resolveMcpLaunch(), env: CLAUDE_DESKTOP_MCP_ENTRY.env } } }, null, 2);
   const hooks = JSON.stringify({
     hooks: Object.fromEntries(
-      HOOK_EVENTS.map((e) => [e, [{ hooks: [{ type: 'command', command: HOOK_COMMAND }] }]])
+      HOOK_EVENTS.map((e) => [e, [{ hooks: [{ type: 'command', command: hook }] }]])
     ),
   }, null, 2);
 
@@ -837,7 +964,7 @@ function printConfigs() {
   console.log('\n~/.cursor/hooks.json (for autonomous chat — keeps agent in room_listen loop):');
   console.log(JSON.stringify({
     version: 1,
-    hooks: { stop: [{ command: HOOK_COMMAND, loop_limit: null }] },
+    hooks: { stop: [{ command: hook, loop_limit: null }] },
   }, null, 2));
 
   console.log('\n--- Windsurf ---');
@@ -854,24 +981,13 @@ function printConfigs() {
 
   console.log('\n--- GitHub Copilot in VS Code ---');
   console.log('User-level mcp.json (or workspace .vscode/mcp.json):');
-  console.log(JSON.stringify({
-    servers: {
-      'agent-room': {
-        type: 'stdio',
-        command: 'npx',
-        args: ['-y', 'agent-room-mcp'],
-        env: { GITHUB_COPILOT: '1' },
-      },
-    },
-  }, null, 2));
+  console.log(JSON.stringify({ servers: { 'agent-room': stdioClientEntry(['-y', 'agent-room-mcp']) } }, null, 2));
 
   // Codex (CLI + IDE extensions + desktop "Codex App") share ~/.codex/config.toml,
   // so a single block covers all three surfaces.
   console.log('\n--- Codex ---');
   console.log('~/.codex/config.toml (CLI, IDE extension, and desktop app):');
-  console.log('[mcp_servers.agent-room]');
-  console.log('command = "npx"');
-  console.log('args = ["-y", "agent-room-mcp"]');
+  console.log(codexMcpServerBlock().trimEnd());
   console.log('');
   console.log('# autonomous chat hooks (optional). Codex gates hooks behind this flag:');
   console.log('[features]');
@@ -882,7 +998,7 @@ function printConfigs() {
     console.log('matcher = ""');
     console.log(`[[hooks.${event}.hooks]]`);
     console.log('type = "command"');
-    console.log(`command = "${HOOK_COMMAND}"`);
+    console.log(`command = ${tomlQuoted(hook)}`);
     console.log('');
   }
   console.log('# Then trust the hooks in Codex once (hooks config UI, or `/hooks trust`);');
