@@ -111,7 +111,9 @@ export function shellQuoteArg(arg: string, platform: NodeJS.Platform = process.p
   if (platform === 'win32') {
     if (arg.length === 0) return '""';
     if (!/[\s"&|<>^%]/.test(arg)) return arg;
-    return `"${arg.replace(/"/g, '\\"')}"`;
+    // cmd.exe does not treat \" as an escaped quote. A path that itself
+    // contains " is escaped by doubling, which is what cmd parses inside quotes.
+    return `"${arg.replace(/"/g, '""')}"`;
   }
   if (arg.length === 0) return "''";
   if (/^[A-Za-z0-9_./:=@+-]+$/.test(arg)) return arg;
@@ -148,6 +150,31 @@ export function hookCommand(
   const posix = [shellQuoteArg(launch.command, platform), ...launch.args.map((arg) => shellQuoteArg(arg, platform)), 'hook'].join(' ');
   if (!base) return posix;
   return `AGENT_ROOM_BASE_URL=${shellQuoteArg(base, platform)} ${posix}`;
+}
+
+/**
+ * Codex `command` / `command_windows` assignments for the current launch.
+ *
+ * On Windows, Codex runs `cmd.exe /C "<command>"` (raw_arg outer quotes). A
+ * command that *starts* with `"` loses its first quote and its last quote, so
+ * ` "D:\Agent Room\node.exe" "D:\Agent Room\index.js" hook ` becomes a split
+ * path and the hook exits 1. The `call` form from `hookCommand` does not start
+ * with a quote, so both the bare string and the outer wrap keep each spaced
+ * path as one argv. `command_windows` is that string; Windows uses it instead
+ * of `command`.
+ */
+export function formatCodexHookCommandLines(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): { hook: string; quotedHook: string; commandLine: string; windowsLine?: string } {
+  const hook = hookCommand(env, platform);
+  const quotedHook = tomlQuoted(hook);
+  return {
+    hook,
+    quotedHook,
+    commandLine: `command = ${quotedHook}`,
+    windowsLine: platform === 'win32' ? `command_windows = ${quotedHook}` : undefined,
+  };
 }
 
 /** JSON MCP client entry. A paired base URL uses the server's HTTP MCP (invite + managed listen). */
@@ -224,6 +251,7 @@ function upsertCodexMcpServer(toml: string, block: string): { toml: string; chan
 /** Replace our hook command in place so the trusted index-0 block stays index 0. */
 export function rewriteCodexHookCommands(toml: string, commandLine: string, windowsLine?: string): string {
   const isHook = (line: string): boolean => new RegExp(HOOK_COMMAND_LINE_RE.source, 'm').test(line);
+  const isWindows = (line: string): boolean => /^\s*command_windows\s*=/.test(line);
   const out: string[] = [];
   const lines = toml.split('\n');
   for (let i = 0; i < lines.length; i++) {
@@ -234,7 +262,15 @@ export function rewriteCodexHookCommands(toml: string, commandLine: string, wind
     }
     out.push(commandLine);
     const next = lines[i + 1] ?? '';
-    if (windowsLine && !/^\s*command_windows\s*=/.test(next)) out.push(windowsLine);
+    // A previous install may already have command_windows with an unquoted
+    // "Agent Room" path. Codex on Windows prefers that field over `command`,
+    // so leaving the stale line in place keeps exiting 1. Replace it.
+    if (isWindows(next)) {
+      i += 1;
+      out.push(windowsLine ?? next);
+      continue;
+    }
+    if (windowsLine) out.push(windowsLine);
   }
   return out.join('\n');
 }
@@ -995,15 +1031,14 @@ export async function installCodex(opts: { hooks: boolean }): Promise<InstallRes
       );
     }
 
-    const hook = hookCommand();
-    const quotedHook = tomlQuoted(hook);
+    const { hook, quotedHook, commandLine, windowsLine } = formatCodexHookCommandLines();
     // Default `npx` stays put: a differently spelled hook is still ours, and
     // rewriting it would invalidate Codex's trust hash for no gain. A bundled
     // or paired-server command must replace `npx`, or Windows keeps launching
-    // a hook that exits 1.
+    // a hook that exits 1. command_windows is replaced in the same pass — Codex
+    // uses it instead of `command` on Windows, including a stale unquoted path.
     if (hook !== HOOK_COMMAND) {
-      const windowsLine = process.platform === 'win32' ? `command_windows = ${quotedHook}` : undefined;
-      const rewritten = rewriteCodexHookCommands(modified, `command = ${quotedHook}`, windowsLine);
+      const rewritten = rewriteCodexHookCommands(modified, commandLine, windowsLine);
       if (rewritten !== modified) {
         modified = rewritten;
         result.changes.push(`updated agent-room hook command in ${path}`);
@@ -1017,8 +1052,8 @@ export async function installCodex(opts: { hooks: boolean }): Promise<InstallRes
       for (const event of HOOK_EVENTS) {
         modified = ensureTrailingBlankLine(modified);
         modified += `[[hooks.${event}]]\nmatcher = ""\n`;
-        modified += `[[hooks.${event}.hooks]]\ntype = "command"\ncommand = ${quotedHook}\n`;
-        if (process.platform === 'win32') modified += `command_windows = ${quotedHook}\n`;
+        modified += `[[hooks.${event}.hooks]]\ntype = "command"\n${commandLine}\n`;
+        if (windowsLine) modified += `${windowsLine}\n`;
       }
       result.changes.push(`installed Stop / UserPromptSubmit / SessionStart hooks in ${path}`);
     }
@@ -1056,7 +1091,7 @@ function printRulesInstruction(target: string, where: string): void {
 }
 
 function printConfigs() {
-  const hook = hookCommand();
+  const { hook, quotedHook, windowsLine } = formatCodexHookCommandLines();
   const mcp = JSON.stringify({ mcpServers: { 'agent-room': mcpClientEntry() } }, null, 2);
   // Both Claude surfaces get the self-identifying entry — a hand-copied config
   // without the marker is the same silent-dropout bug as one written by init.
@@ -1119,7 +1154,8 @@ function printConfigs() {
     console.log('matcher = ""');
     console.log(`[[hooks.${event}.hooks]]`);
     console.log('type = "command"');
-    console.log(`command = ${tomlQuoted(hook)}`);
+    console.log(`command = ${quotedHook}`);
+    if (windowsLine) console.log(windowsLine);
     console.log('');
   }
   console.log('# Then trust the hooks in Codex once (hooks config UI, or `/hooks trust`);');

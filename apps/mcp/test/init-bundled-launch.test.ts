@@ -3,15 +3,44 @@ import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  formatCodexHookCommandLines,
   hookCommand,
   hostedMcpUrl,
   installCodex,
   mcpClientEntry,
   resolveMcpLaunch,
+  rewriteCodexHookCommands,
   shellQuoteArg,
   stripWin32VerbatimPrefix,
   tomlQuoted,
 } from '../src/init.js';
+
+/**
+ * ReactOS/Windows `cmd /C` quote rule: a remainder that starts with `"` drops
+ * that quote and the last `"` on the line (unless the two-quote executable
+ * exception applies). Codex passes the hook as `cmd /C "<command>"`.
+ */
+function cmdSlashC(remainder: string): string {
+  const trimmed = remainder.trimStart();
+  if (!trimmed.startsWith('"')) return trimmed;
+  const afterFirst = trimmed.slice(1);
+  const last = afterFirst.lastIndexOf('"');
+  if (last < 0) return trimmed;
+  const inside = afterFirst.slice(0, last);
+  const quoteCount = trimmed.match(/"/g)?.length ?? 0;
+  const preserve = quoteCount === 2 && /\s/.test(inside) && !/["&<>@^|]/.test(inside);
+  if (preserve) return trimmed;
+  return afterFirst.slice(0, last) + afterFirst.slice(last + 1);
+}
+
+function decodeTomlQuoted(assignment: string): string {
+  const value = assignment.replace(/^[^=]*=\s*/, '');
+  if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1);
+  if (value.startsWith('"') && value.endsWith('"')) {
+    return value.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  return value;
+}
 
 const NODE = '/opt/agent-room/node';
 const ENTRY = '/opt/agent-room/resources/mcp/dist/index.js';
@@ -51,6 +80,48 @@ describe('resolveMcpLaunch', () => {
     expect(hook.startsWith('"')).toBe(false);
     expect(tomlQuoted(hook)).toBe(`'${hook}'`);
     expect(shellQuoteArg(NODE, 'linux')).toBe(NODE);
+    // Codex cmd.exe /C strips a leading quote and the last quote. `call` keeps
+    // each spaced path quoted both bare and inside that outer wrap.
+    expect(cmdSlashC(hook)).toBe(hook);
+    expect(cmdSlashC(`"${hook}"`)).toBe(hook);
+    expect(cmdSlashC(`"${hook}"`)).toContain(`"${WIN_NODE}"`);
+    expect(cmdSlashC(`"${hook}"`)).toContain(`"${WIN_ENTRY}"`);
+    const lines = formatCodexHookCommandLines(env, 'win32');
+    expect(lines.commandLine).toBe(`command = '${hook}'`);
+    expect(lines.windowsLine).toBe(`command_windows = '${hook}'`);
+    expect(lines.windowsLine).toContain('Agent Room');
+    expect(decodeTomlQuoted(lines.windowsLine!)).toBe(hook);
+  });
+
+  it('replaces a stale command_windows whose Agent Room path is split on spaces', () => {
+    const env = {
+      AGENT_ROOM_MCP_COMMAND: WIN_NODE,
+      AGENT_ROOM_MCP_ARGS: JSON.stringify([WIN_ENTRY]),
+    };
+    const programFiles = 'C:\\Program Files\\Agent Room\\resources\\node\\node.exe';
+    const programEntry = 'C:\\Program Files\\Agent Room\\resources\\mcp\\dist\\index.js';
+    const spaced = hookCommand({
+      AGENT_ROOM_MCP_COMMAND: programFiles,
+      AGENT_ROOM_MCP_ARGS: JSON.stringify([programEntry]),
+    }, 'win32');
+    expect(spaced).toBe(`call "${programFiles}" "${programEntry}" hook`);
+    expect(cmdSlashC(`"${spaced}"`)).toContain(`"${programFiles}"`);
+    expect(cmdSlashC(spaced).startsWith('call "')).toBe(true);
+
+    const stale = [
+      '[[hooks.Stop.hooks]]',
+      'type = "command"',
+      'command = "npx -y agent-room-mcp hook"',
+      'command_windows = "D:\\\\Agent Room\\\\resources\\\\node\\\\node.exe D:\\\\Agent Room\\\\resources\\\\mcp\\\\dist\\\\index.js hook"',
+      '',
+    ].join('\n');
+    const { commandLine, windowsLine } = formatCodexHookCommandLines(env, 'win32');
+    const rewritten = rewriteCodexHookCommands(stale, commandLine, windowsLine);
+    expect(rewritten).toContain(commandLine);
+    expect(rewritten).toContain(windowsLine!);
+    expect(rewritten).not.toContain('node.exe D:');
+    expect(decodeTomlQuoted(windowsLine!)).toContain(`"${WIN_NODE}"`);
+    expect(rewriteCodexHookCommands(rewritten, commandLine, windowsLine)).toBe(rewritten);
   });
 
   it('keeps a client env marker on stdio and uses HTTP when a server is paired', () => {

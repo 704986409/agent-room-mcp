@@ -112,7 +112,36 @@ export const CORE_PROFILE_TOOLS = new Set([
   'room_minutes',
   'room_leave',
   'room_end',
+  'room_sleep',
 ]);
+
+/** recentMessages on room_join are backlog, not a new turn. */
+export function recentMessagesContextHint(count: number): string {
+  return `${count} recent messages above are context ONLY. Do not re-execute old @ mentions. Act only on new messages after the cursor.`;
+}
+
+/**
+ * seatKey to keep on the stdio state file. A server-issued key wins (it may
+ * have rotated); then an explicit argument; then the key already stored.
+ */
+export function seatKeyToStore(serverSeat: unknown, argSeat: unknown, stored?: string): string | undefined {
+  const server = typeof serverSeat === 'string' ? serverSeat.trim() : '';
+  const arg = typeof argSeat === 'string' ? argSeat.trim() : '';
+  const saved = stored?.trim() ?? '';
+  return server || arg || saved || undefined;
+}
+
+export const HTTP_MCP_SEAT_KEY_HINT =
+  'HTTP MCP has no local seat file, so an omitted seatKey cannot be filled in. Pass the seatKey returned by room_join on every room_sleep. The stdio MCP fills an omitted seatKey from local state saved at join. Do not paste the seatKey into the room.';
+
+/** Explicit seatKey wins. When omitted, stdio fills from local state. */
+export function resolveSleepSeatKey(explicit: unknown, stored?: string): { seatKey?: string; source?: 'argument' | 'local_state' } {
+  const arg = typeof explicit === 'string' ? explicit.trim() : '';
+  if (arg) return { seatKey: arg, source: 'argument' };
+  const saved = stored?.trim() ?? '';
+  if (saved) return { seatKey: saved, source: 'local_state' };
+  return {};
+}
 
 // Consolidated surface: families that used to be one-tool-per-verb are now
 // single tools with an `action`/flag parameter. The dispatch below still runs
@@ -774,8 +803,8 @@ export function registerTools(server: Server) {
   // guaranteed drop-out — the background watcher is its only persistence.
   const shouldAutoWatch = harness.kind === 'cursor' || harness.kind === 'copilot';
 
-  // Tool profiles. `core` trims the surface to the nine tools a guest agent
-  // actually needs (create/join/send/status/listen/read/minutes/leave/end),
+  // Tool profiles. `core` trims the surface to the tools a guest agent
+  // actually needs (create/join/send/listen/minutes/sleep/leave/end),
   // which cuts the context cost and permission-prompt noise for lightweight
   // setups. Default stays `full` so existing installs — including host flows
   // that drive the task board and reply modes — keep every tool. The hosted
@@ -818,6 +847,7 @@ export function registerTools(server: Server) {
             role: { type: 'string', description: 'Your role (optional)' },
             listenAfterJoin: { type: 'boolean', description: 'Default true: run the first listen window in this call.' },
             listenTimeoutMs: { type: 'number', description: `First listen duration (default ${DEFAULT_LISTEN_MS}, max ${MAX_LISTEN_MS}).` },
+            seatKey: { type: 'string', description: 'Optional. Stored locally by the stdio MCP for a later room_sleep. HTTP MCP must keep the returned seatKey and pass it on the next join.' },
           },
         },
       },
@@ -879,6 +909,25 @@ export function registerTools(server: Server) {
             code: { type: 'string', description: 'Room code' },
             export: { type: 'boolean', description: 'Also publish a shareable report (default false)' },
             stats: { type: 'boolean', description: 'Include the auto-retro stats block (default false)' },
+          },
+        },
+      },
+      {
+        name: 'room_sleep',
+        description:
+          'Hand the message cursor to the server and go idle. seatKey is optional on the stdio MCP: when omitted, it is filled from local state saved at room_join. ' +
+          'HTTP MCP must pass seatKey every time — there is no local seat file to fill from. Do not print the seatKey.',
+        inputSchema: {
+          type: 'object',
+          required: ['code'],
+          properties: {
+            code: { type: 'string', description: 'Room code' },
+            name: { type: 'string', description: 'Your display name (optional; defaults to the stored session name)' },
+            cursor: { type: 'number', description: 'Absolute message cursor to hand off (optional; defaults to the stored cursor)' },
+            seatKey: {
+              type: 'string',
+              description: 'Omit on stdio MCP to use the seatKey saved at room_join. Required on HTTP MCP — pass the room_join seatKey. Never post it in the room.',
+            },
           },
         },
       },
@@ -1039,7 +1088,7 @@ export function registerTools(server: Server) {
       if (parsed) a.code = parsed;
     }
 
-    if (name !== 'room_sleep' && activeProfile === 'core' && !CORE_PROFILE_TOOLS.has(CANONICAL_NAME[name] ?? name)) {
+    if (activeProfile === 'core' && !CORE_PROFILE_TOOLS.has(CANONICAL_NAME[name] ?? name)) {
       return ok({
         error: 'unknown_tool',
         hint:
@@ -1066,7 +1115,7 @@ export function registerTools(server: Server) {
         joinedAt: Date.now(),
         lastSeenAt: Date.now(),
       };
-      await joinRoom(client, code, participant, {
+      const hostSeat = await joinRoom(client, code, participant, {
         hostKey: created.hostKey,
         priorIdentity: { name: a.name, client: 'cc' },
       });
@@ -1076,7 +1125,17 @@ export function registerTools(server: Server) {
       // parallel sessions don't share keys.
       // ownerRunId binds the room to the thread that created it, so a sibling
       // thread on the same harness cannot claim it by reaching Stop first.
-      await setRoom(code, { name: a.name, cursor: initialCursor, joinedAt: Date.now(), hostKey: created.hostKey, clientKind: harness.kind, ownerRunId: harnessRunId(), gameVersion: created.gameVersion });
+      const createdSeatKey = seatKeyToStore(hostSeat.seatKey, a.seatKey, undefined);
+      await setRoom(code, {
+        name: a.name,
+        cursor: initialCursor,
+        joinedAt: Date.now(),
+        hostKey: created.hostKey,
+        ...(createdSeatKey ? { seatKey: createdSeatKey } : {}),
+        clientKind: harness.kind,
+        ownerRunId: harnessRunId(),
+        gameVersion: created.gameVersion,
+      });
 
       const listenAfterJoin = defaultListenAfterJoin(harness, a.listenAfterJoin);
       const listenMs = resolvedListenTimeoutMs(a.listenTimeoutMs, harness.maxListenMs);
@@ -1154,6 +1213,7 @@ export function registerTools(server: Server) {
       try {
         updated = await joinRoom(client, a.code, participant, {
           hostKey: storedStateRoom?.hostKey,
+          seatKey: typeof a.seatKey === 'string' && a.seatKey.trim() ? a.seatKey.trim() : storedStateRoom?.seatKey,
           ...(priorIdentity ? { priorIdentity } : {}),
         });
       } catch (e) {
@@ -1186,7 +1246,17 @@ export function registerTools(server: Server) {
         } catch { /* greeting is nice-to-have; join/listen must still proceed */ }
       }
       const { messages: msgs, cursor: initialCursor } = await readMessagesAtHead(client, a.code);
-      await setRoom(a.code, { name: finalName, cursor: initialCursor, joinedAt: Date.now(), clientKind: harness.kind, ownerRunId: harnessRunId(), gameVersion: updated.gameVersion });
+      const joinedSeatKey = seatKeyToStore(updated.seatKey, a.seatKey, storedStateRoom?.seatKey);
+      await setRoom(a.code, {
+        name: finalName,
+        cursor: initialCursor,
+        joinedAt: Date.now(),
+        ...(storedStateRoom?.hostKey ? { hostKey: storedStateRoom.hostKey } : {}),
+        ...(joinedSeatKey ? { seatKey: joinedSeatKey } : {}),
+        clientKind: harness.kind,
+        ownerRunId: harnessRunId(),
+        gameVersion: updated.gameVersion,
+      });
       const recentMessages = msgs.slice(-20).map((m: Message) => ({
         name: m.name,
         role: m.role,
@@ -1210,9 +1280,10 @@ export function registerTools(server: Server) {
         if (!first.terminated && shouldAutoWatch) {
           startRoomWatcher(a.code, finalName, first.cursor);
         }
+        const contextOnly = recentMessagesContextHint(recentMessages.length);
         const joinLine = muted
-          ? `Joined as "${finalName}" — but the host (${updated.createdBy}) has muted you in this room. room_send will return error="muted" until you are unmuted. Call room_listen to read the conversation while you wait.`
-          : `Joined as "${finalName}". ${recentMessages.length} recent messages above for context.`;
+          ? `Joined as "${finalName}" — but the host (${updated.createdBy}) has muted you in this room. room_send will return error="muted" until you are unmuted. Call room_listen to read the conversation while you wait. ${contextOnly}`
+          : `Joined as "${finalName}". ${contextOnly}`;
         return ok({
           code: a.code,
           topic: updated.topic,
@@ -1276,8 +1347,8 @@ export function registerTools(server: Server) {
         autoWatchStarted: shouldAutoWatch,
         clientKind: harness.kind,
         hint: muted
-          ? `Joined as "${finalName}" — but the host (${updated.createdBy}) has muted you in this room. room_send will return error="muted" until you're unmuted. Call room_listen to read the conversation while you wait. ${nextListenContract(a.code, initialCursor)}${persistenceNudge}`
-          : `Joined as "${finalName}". ${recentMessages.length} recent messages above for context. ${nextListenContract(a.code, initialCursor)}${persistenceNudge}`,
+          ? `Joined as "${finalName}" — but the host (${updated.createdBy}) has muted you in this room. room_send will return error="muted" until you're unmuted. Call room_listen to read the conversation while you wait. ${recentMessagesContextHint(recentMessages.length)} ${nextListenContract(a.code, initialCursor)}${persistenceNudge}`
+          : `Joined as "${finalName}". ${recentMessagesContextHint(recentMessages.length)} ${nextListenContract(a.code, initialCursor)}${persistenceNudge}`,
       });
     }
 
@@ -1677,12 +1748,27 @@ export function registerTools(server: Server) {
         selfName = room.name;
       }
       const cursor = typeof a.cursor === 'number' ? a.cursor : room?.cursor ?? 0;
+      const resolved = resolveSleepSeatKey(a.seatKey, room?.seatKey);
+      if (!resolved.seatKey) {
+        return ok({
+          status: 'sleep_failed',
+          error: 'seat_key_required',
+          code,
+          name: selfName,
+          cursor,
+          hint: HTTP_MCP_SEAT_KEY_HINT,
+        });
+      }
+      const seatKey = resolved.seatKey;
+      if (room && room.seatKey !== seatKey) {
+        await setRoom(code, { ...room, seatKey });
+      }
       try {
         await roomSleep(client, {
           code,
           name: selfName,
           cursor,
-          seatKey: room?.seatKey,
+          seatKey,
         });
       } catch { /* server sleep call is best-effort */ }
 
@@ -1690,7 +1776,7 @@ export function registerTools(server: Server) {
         code,
         name: selfName,
         cursor,
-        seatKey: room?.seatKey,
+        seatKey,
         sessionId: room?.sessionKey,
         at: Date.now(),
       });
@@ -1702,7 +1788,10 @@ export function registerTools(server: Server) {
         code,
         name: selfName,
         cursor,
-        hint: 'Cursor handed off. Session is entering sleep state.',
+        seatKeySource: resolved.source,
+        hint: resolved.source === 'local_state'
+          ? 'Cursor handed off. seatKey was omitted and filled from local stdio state. HTTP MCP cannot do this — pass the seatKey from room_join. Do not paste it into the room.'
+          : 'Cursor handed off. Session is entering sleep state.',
       });
     }
 

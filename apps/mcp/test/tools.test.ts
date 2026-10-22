@@ -1,5 +1,54 @@
 import { describe, expect, it } from 'vitest';
-import { messagesToReturnAfterSend, STDIO_SERVER_INSTRUCTIONS, unreadMessagesBeforeSend } from '../src/tools.js';
+import {
+  HTTP_MCP_SEAT_KEY_HINT,
+  messagesToReturnAfterSend,
+  recentMessagesContextHint,
+  resolveSleepSeatKey,
+  seatKeyToStore,
+  STDIO_SERVER_INSTRUCTIONS,
+  unreadMessagesBeforeSend,
+} from '../src/tools.js';
+
+describe('room_join recentMessages hint', () => {
+  it('marks backlog as context only and refuses to replay old mentions', () => {
+    const hint = recentMessagesContextHint(4);
+    expect(hint).toContain('context ONLY');
+    expect(hint).toContain('Do not re-execute old @');
+    expect(hint).toContain('new messages after the cursor');
+    expect(hint.startsWith('4 recent messages')).toBe(true);
+  });
+});
+
+describe('room_sleep seatKey', () => {
+  it('fills an omitted seatKey from local stdio state', () => {
+    expect(resolveSleepSeatKey(undefined, 'seat-from-state')).toEqual({
+      seatKey: 'seat-from-state',
+      source: 'local_state',
+    });
+    expect(resolveSleepSeatKey('  ', 'seat-from-state').source).toBe('local_state');
+  });
+
+  it('keeps an explicit seatKey ahead of local state', () => {
+    expect(resolveSleepSeatKey(' seat-arg ', 'seat-from-state')).toEqual({
+      seatKey: 'seat-arg',
+      source: 'argument',
+    });
+  });
+
+  it('tells HTTP MCP to pass seatKey when nothing local is stored', () => {
+    expect(resolveSleepSeatKey(undefined, undefined)).toEqual({});
+    expect(HTTP_MCP_SEAT_KEY_HINT).toContain('HTTP MCP');
+    expect(HTTP_MCP_SEAT_KEY_HINT).toContain('omitted seatKey cannot be filled');
+    expect(HTTP_MCP_SEAT_KEY_HINT).toContain('Pass the seatKey');
+  });
+
+  it('stores a server seatKey ahead of the argument and the previous local key', () => {
+    expect(seatKeyToStore('rotated', 'arg', 'stored')).toBe('rotated');
+    expect(seatKeyToStore(undefined, ' arg ', 'stored')).toBe('arg');
+    expect(seatKeyToStore('', '', ' stored ')).toBe('stored');
+    expect(seatKeyToStore(undefined, undefined, undefined)).toBeUndefined();
+  });
+});
 
 describe('active-room presence contract', () => {
   it('does not treat quiet rooms or completed tasks as stop conditions', () => {

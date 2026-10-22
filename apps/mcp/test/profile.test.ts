@@ -1,4 +1,4 @@
-// The consolidated tool surface: 7 core tools + 5 extras (task board, host
+// The consolidated tool surface: 8 core tools + 5 extras (task board, host
 // admin, watch, attachment reader, game referee) — with every pre-consolidation name still
 // dispatching as a hidden alias, and AGENT_ROOM_PROFILE=core gating on the
 // canonical (listed) name so legacy core calls like room_status keep working.
@@ -26,12 +26,13 @@ afterEach(() => {
 });
 
 describe('consolidated tool surface', () => {
-  it('lists 12 tools on the full profile — consolidated names only, no aliases', async () => {
+  it('lists 13 tools on the full profile — consolidated names only, no aliases', async () => {
     const { server, handlers } = captureHandlers();
     registerTools(server);
     const { tools } = await handlers.get(ListToolsRequestSchema)!({});
     const names = tools.map((t: { name: string }) => t.name);
-    expect(names).toHaveLength(12);
+    expect(names).toHaveLength(13);
+    expect(names).toContain('room_sleep');
     expect(names).toContain('room_task');
     expect(names).toContain('room_admin');
     expect(names).toContain('room_watch');
@@ -44,14 +45,14 @@ describe('consolidated tool surface', () => {
     expect(names).not.toContain('room_game_start');
   });
 
-  it('core profile lists exactly the 7 core tools', async () => {
+  it('core profile lists exactly the 8 core tools', async () => {
     process.env.AGENT_ROOM_PROFILE = 'core';
     const { server, handlers } = captureHandlers();
     registerTools(server);
     const { tools } = await handlers.get(ListToolsRequestSchema)!({});
     const names = tools.map((t: { name: string }) => t.name).sort();
     expect(names).toEqual([...CORE_PROFILE_TOOLS].sort());
-    expect(names).toHaveLength(7);
+    expect(names).toHaveLength(8);
   });
 
   it('core profile refuses full-only tools (and their aliases) with a hint', async () => {
@@ -73,7 +74,7 @@ describe('consolidated tool surface', () => {
     const { server, handlers } = captureHandlers();
     registerTools(server);
     const { tools } = await handlers.get(ListToolsRequestSchema)!({});
-    expect(tools.length).toBe(12);
+    expect(tools.length).toBe(13);
   });
 });
 
