@@ -285,6 +285,34 @@ describe('Stop Hook execution (runHook)', () => {
     });
   });
 
+  it('managed session with no local state sleeps from the daemon env and exits 0', async () => {
+    vi.stubEnv('AGENT_ROOM_MANAGED', '1');
+    vi.stubEnv('AGENT_ROOM_CODE', '89K-E3G-9QH');
+    vi.stubEnv('AGENT_ROOM_NAME', 'Codex');
+    vi.stubEnv('AGENT_ROOM_SEAT_KEY', 'seat-from-env');
+    vi.stubEnv('AGENT_ROOM_CURSOR', '4');
+    vi.stubEnv('AGENT_ROOM_BASE_URL', 'https://ai-room.pupgo.top');
+
+    let slept: Record<string, unknown> | undefined;
+    let exitCode: number | null = null;
+    fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (info, init) => {
+      const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+      expect(String(info)).toBe('https://ai-room.pupgo.top/api/room');
+      if (body.action === 'sleep') slept = body;
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+
+    await runHook(
+      { hook_event_name: 'Stop', session_id: 'sess-env' },
+      { stdout: () => undefined, exit: (code) => { exitCode = code; } },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(slept).toMatchObject({
+      action: 'sleep', code: '89K-E3G-9QH', name: 'Codex', cursor: 4, seatKey: 'seat-from-env',
+    });
+  });
+
   it('manual session: delivers messages and resumes session when @ for this agent arrives', async () => {
     await setRoom('ROOM-MANUAL-1', {
       name: 'Claude',

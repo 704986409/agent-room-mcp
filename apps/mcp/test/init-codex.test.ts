@@ -8,15 +8,23 @@ import { installCodex, countInstalledCodexHookCommands } from '../src/init.js';
 // at a temp dir so the test never touches the real user config.
 let codexHome: string;
 const prevCodexHome = process.env.CODEX_HOME;
+const prevBase = process.env.AGENT_ROOM_BASE_URL;
+const prevServer = process.env.AGENT_ROOM_SERVER;
 
 beforeEach(async () => {
   codexHome = await mkdtemp(join(tmpdir(), 'agent-room-codex-'));
   process.env.CODEX_HOME = codexHome;
+  delete process.env.AGENT_ROOM_BASE_URL;
+  delete process.env.AGENT_ROOM_SERVER;
 });
 
 afterEach(() => {
   if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = prevCodexHome;
+  if (prevBase === undefined) delete process.env.AGENT_ROOM_BASE_URL;
+  else process.env.AGENT_ROOM_BASE_URL = prevBase;
+  if (prevServer === undefined) delete process.env.AGENT_ROOM_SERVER;
+  else process.env.AGENT_ROOM_SERVER = prevServer;
 });
 
 const configPath = () => join(codexHome, 'config.toml');

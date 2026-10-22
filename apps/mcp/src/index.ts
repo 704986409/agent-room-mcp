@@ -11,7 +11,11 @@ import { runHook } from './hook.js';
 const sub = process.argv[2];
 
 if (sub === 'hook') {
-  await runHook();
+  try {
+    await runHook();
+  } catch {
+    process.exit(0);
+  }
 } else if (sub === 'init') {
   const { runInit } = await import('./init.js');
   await runInit(process.argv.slice(3));

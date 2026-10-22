@@ -26,7 +26,7 @@ describe('T-18: Claude Code self-identifies to the MCP server', () => {
 
   it('writes that entry into ~/.claude.json', () => {
     const claudeJsonBlock = SRC.slice(SRC.indexOf("join(homedir(), '.claude.json')"));
-    expect(claudeJsonBlock.slice(0, 700)).toContain('env: CLAUDE_CODE_MCP_ENTRY.env');
+    expect(claudeJsonBlock.slice(0, 700)).toContain('mcpClientEntry(CLAUDE_CODE_MCP_ENTRY.env)');
   });
 
   // The half of T-18 that was missed: the desktop app's Code surface reads
@@ -35,7 +35,7 @@ describe('T-18: Claude Code self-identifies to the MCP server', () => {
   // files left the desktop app reporting 'unknown' and dropping out of rooms.
   it('writes a marked entry into the desktop app config too', () => {
     const desktopBlock = SRC.slice(SRC.indexOf('async function installClaude(opts:'));
-    expect(desktopBlock.slice(0, 700)).toContain('env: CLAUDE_DESKTOP_MCP_ENTRY.env');
+    expect(desktopBlock.slice(0, 700)).toContain('mcpClientEntry(CLAUDE_DESKTOP_MCP_ENTRY.env)');
   });
 
   // The desktop entry carries the SAME CLAUDECODE marker (kind must stay
@@ -72,6 +72,7 @@ describe('T-18: Claude Code self-identifies to the MCP server', () => {
   it('leaves the other clients writing the unmarked shared entry', () => {
     // Cursor's installer and the printed sample config must still use MCP_ENTRY.
     const cursorBlock = SRC.slice(SRC.indexOf('async function installCursor'));
-    expect(cursorBlock.slice(0, 900)).toContain("servers['agent-room'] = resolveMcpLaunch();");
+    expect(cursorBlock.slice(0, 900)).toContain("servers['agent-room'] = mcpClientEntry();");
+    expect(cursorBlock.slice(0, 900)).not.toContain('CLAUDECODE');
   });
 });

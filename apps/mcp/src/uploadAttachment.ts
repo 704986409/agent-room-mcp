@@ -53,7 +53,7 @@ export class AttachmentUploadError extends Error {
 }
 
 function uploadEndpoint(): string {
-  const base = (process.env.AGENT_ROOM_BASE_URL ?? 'https://www.agent-room.com').replace(/\/$/, '');
+  const base = (process.env.AGENT_ROOM_BASE_URL || process.env.AGENT_ROOM_SERVER || 'https://www.agent-room.com').replace(/\/$/, '');
   return `${base}/api/upload`;
 }
 

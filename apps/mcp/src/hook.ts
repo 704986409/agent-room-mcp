@@ -520,6 +520,17 @@ export interface RunHookIO {
 }
 
 export async function runHook(testInput?: HookInput, io?: RunHookIO): Promise<void> {
+  const exitProcess = io?.exit ?? ((code: number) => process.exit(code));
+  try {
+    await executeHook(testInput, io);
+  } catch {
+    // A Stop hook that throws is reported as "hook exited with code 1" and
+    // drops the agent out of the room. Exit 0: no continuation, no failure.
+    exitProcess(0);
+  }
+}
+
+async function executeHook(testInput: HookInput | undefined, io: RunHookIO | undefined): Promise<void> {
   const writeStdout = io?.stdout ?? ((d: string) => process.stdout.write(d));
   const exitProcess = io?.exit ?? ((code: number) => process.exit(code));
 
@@ -589,8 +600,10 @@ export async function runHook(testInput?: HookInput, io?: RunHookIO): Promise<vo
 
       const state = await readHookState(stateScope);
       const client = createRoomApiClient();
+      let handedOff = false;
       for (const [code, r] of Object.entries(state.rooms)) {
         if (!roomBelongsToSession(r, sessionKey)) continue;
+        handedOff = true;
         await performHandoff(client, {
           code,
           name: r.name,
@@ -598,6 +611,18 @@ export async function runHook(testInput?: HookInput, io?: RunHookIO): Promise<vo
           seatKey: r.seatKey,
           sessionId: r.sessionKey ?? sessionKey,
         });
+      }
+      // HTTP MCP joins do not write the stdio state file. The daemon puts the
+      // seat on the process env; sleep from that so a managed turn can go idle
+      // and the next @ can wake it.
+      if (!handedOff) {
+        const code = process.env.AGENT_ROOM_CODE?.trim();
+        const name = process.env.AGENT_ROOM_NAME?.trim();
+        const seatKey = process.env.AGENT_ROOM_SEAT_KEY?.trim();
+        const cursor = Number(process.env.AGENT_ROOM_CURSOR);
+        if (code && name && seatKey && Number.isFinite(cursor)) {
+          await performHandoff(client, { code, name, cursor, seatKey, sessionId: sessionKey });
+        }
       }
       await resetStopContinuationBudget(stateScope);
     } catch { /* best-effort handoff before exit */ }
@@ -615,7 +640,9 @@ export async function runHook(testInput?: HookInput, io?: RunHookIO): Promise<vo
     return;
   }
 
-  await commitCursors(pending, stateScope); // advance cursors even when only own-messages were skipped
+  try {
+    await commitCursors(pending, stateScope); // advance cursors even when only own-messages were skipped
+  } catch { /* a state-file write must not fail the hook */ }
 
   const withAnyMessages = pending.filter((r) => r.messages.length > 0);
   let hasMention = withAnyMessages.some((r) =>

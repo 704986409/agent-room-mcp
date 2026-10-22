@@ -83,7 +83,9 @@ function errorFromBody(error: string | undefined, message: string, status: numbe
 }
 
 function apiEndpoint(): string {
-  const base = (process.env.AGENT_ROOM_BASE_URL ?? 'https://www.agent-room.com').replace(/\/$/, '');
+  // The desktop daemon exports AGENT_ROOM_SERVER. Hooks inherit that even when
+  // the MCP config has not yet been rewritten with AGENT_ROOM_BASE_URL.
+  const base = (process.env.AGENT_ROOM_BASE_URL || process.env.AGENT_ROOM_SERVER || 'https://www.agent-room.com').replace(/\/$/, '');
   return `${base}/api/room`;
 }
 

@@ -306,13 +306,25 @@ export async function readHarnessStateOrMerged(): Promise<AgentRoomState> {
   return readMergedState();
 }
 
+/** Windows `fs.rename` cannot replace an existing file (EPERM/EEXIST). */
+async function replaceFile(tmp: string, file: string): Promise<void> {
+  try {
+    await fs.rename(tmp, file);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== 'EPERM' && code !== 'EEXIST') throw error;
+    await fs.rm(file, { force: true });
+    await fs.rename(tmp, file);
+  }
+}
+
 async function writeStateFile(file: string, state: AgentRoomState): Promise<void> {
   await fs.mkdir(dirname(file), { recursive: true });
   const tmp = file + '.tmp';
   // 0600: the file carries hostKey; don't leave it group/world-readable on
   // shared machines. The tmp file is recreated on every write, so the mode always applies.
   await fs.writeFile(tmp, JSON.stringify(state, null, 2), { encoding: 'utf8', mode: 0o600 });
-  await fs.rename(tmp, file);
+  await replaceFile(tmp, file);
 }
 
 /** Age after which a dead session's state file is discarded even if it still
@@ -625,7 +637,7 @@ export async function writeHandoff(record: HandoffRecord): Promise<void> {
   const roomFile = join(dir, `handoff-${record.code}.json`);
   const roomTmp = roomFile + '.tmp';
   await fs.writeFile(roomTmp, data, { encoding: 'utf8', mode: 0o600 });
-  await fs.rename(roomTmp, roomFile);
+  await replaceFile(roomTmp, roomFile);
 
   // 2. Also write/update general handoff.json
   const mainFile = join(dir, 'handoff.json');
@@ -659,7 +671,7 @@ export async function writeHandoff(record: HandoffRecord): Promise<void> {
   };
   const mainTmp = mainFile + '.tmp';
   await fs.writeFile(mainTmp, JSON.stringify(combined, null, 2), { encoding: 'utf8', mode: 0o600 });
-  await fs.rename(mainTmp, mainFile);
+  await replaceFile(mainTmp, mainFile);
 
   // 3. If AGENT_ROOM_HANDOFF_FILE is explicitly set in env, write to it as well
   if (process.env.AGENT_ROOM_HANDOFF_FILE) {
@@ -667,7 +679,7 @@ export async function writeHandoff(record: HandoffRecord): Promise<void> {
     await fs.mkdir(dirname(customFile), { recursive: true }).catch(() => {});
     const customTmp = customFile + '.tmp';
     await fs.writeFile(customTmp, data, { encoding: 'utf8', mode: 0o600 });
-    await fs.rename(customTmp, customFile);
+    await replaceFile(customTmp, customFile);
   }
 }
 

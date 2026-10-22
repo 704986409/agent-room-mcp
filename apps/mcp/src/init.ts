@@ -118,13 +118,45 @@ export function shellQuoteArg(arg: string, platform: NodeJS.Platform = process.p
   return `'${arg.replace(/'/g, `'\\''`)}'`;
 }
 
+/** Paired desktop server. `AGENT_ROOM_SERVER` is what the daemon already exports. */
+export function pairedBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
+  const raw = (env.AGENT_ROOM_BASE_URL || env.AGENT_ROOM_SERVER || '').trim();
+  return raw.replace(/\/$/, '');
+}
+
+/** Hosted Streamable HTTP MCP. Empty when init is not pointed at a paired server. */
+export function hostedMcpUrl(env: NodeJS.ProcessEnv = process.env): string {
+  const base = pairedBaseUrl(env);
+  return base ? `${base}/mcp` : '';
+}
+
 export function hookCommand(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
 ): string {
   const launch = resolveMcpLaunch(env);
-  if (isDefaultLaunch(launch)) return HOOK_COMMAND;
-  return [shellQuoteArg(launch.command, platform), ...launch.args.map((arg) => shellQuoteArg(arg, platform)), 'hook'].join(' ');
+  const base = pairedBaseUrl(env);
+  if (isDefaultLaunch(launch) && !base) return HOOK_COMMAND;
+  // Codex runs the string through cmd.exe. A command that starts with `"` loses
+  // its first and last quote (paths with spaces then fail, exit 1). `call` keeps
+  // each quoted argv intact with and without Codex's extra wrapping quotes.
+  if (platform === 'win32') {
+    const call = ['call', shellQuoteArg(launch.command, 'win32'), ...launch.args.map((arg) => shellQuoteArg(arg, 'win32')), 'hook'].join(' ');
+    if (!base) return call;
+    return `set "AGENT_ROOM_BASE_URL=${base}"&& ${call}`;
+  }
+  const posix = [shellQuoteArg(launch.command, platform), ...launch.args.map((arg) => shellQuoteArg(arg, platform)), 'hook'].join(' ');
+  if (!base) return posix;
+  return `AGENT_ROOM_BASE_URL=${shellQuoteArg(base, platform)} ${posix}`;
+}
+
+/** JSON MCP client entry. A paired base URL uses the server's HTTP MCP (invite + managed listen). */
+export function mcpClientEntry(extraEnv?: Record<string, string>, env: NodeJS.ProcessEnv = process.env): Record<string, unknown> {
+  const url = hostedMcpUrl(env);
+  if (url) return { type: 'http', url };
+  const launch = resolveMcpLaunch(env);
+  if (extraEnv && Object.keys(extraEnv).length > 0) return { ...launch, env: extraEnv };
+  return { ...launch };
 }
 
 function tomlBasicString(value: string): string {
@@ -144,9 +176,67 @@ export function tomlQuoted(value: string): string {
 }
 
 function codexMcpServerBlock(env: NodeJS.ProcessEnv = process.env): string {
+  const url = hostedMcpUrl(env);
+  if (url) return `[mcp_servers.agent-room]\nurl = ${tomlQuoted(url)}\n`;
   const launch = resolveMcpLaunch(env);
   const args = launch.args.map((arg) => tomlQuoted(arg)).join(', ');
   return `[mcp_servers.agent-room]\ncommand = ${tomlQuoted(launch.command)}\nargs = [${args}]\n`;
+}
+
+const CODEX_SERVER_HEADER_RE = /^\[mcp_servers\.agent-room(?:\.[^\]]+)?\]\s*$/;
+
+/** Drop `[mcp_servers.agent-room]` and its subtables (`env`, …). Other servers stay. */
+export function stripCodexAgentRoomServer(toml: string): string {
+  const out: string[] = [];
+  let skipping = false;
+  for (const line of toml.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('[')) skipping = CODEX_SERVER_HEADER_RE.test(trimmed);
+    if (!skipping) out.push(line);
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n');
+}
+
+function codexServerLines(toml: string): string[] | undefined {
+  const lines = toml.split('\n');
+  const start = lines.findIndex((line) => line.trim() === '[mcp_servers.agent-room]');
+  if (start < 0) return undefined;
+  const section = ['[mcp_servers.agent-room]'];
+  for (let i = start + 1; i < lines.length; i++) {
+    const trimmed = lines[i]!.trim();
+    if (trimmed.startsWith('[')) break;
+    if (trimmed) section.push(trimmed);
+  }
+  return section;
+}
+
+function upsertCodexMcpServer(toml: string, block: string): { toml: string; changed: boolean } {
+  const wanted = block.trim().split('\n').map((line) => line.trim()).filter((line) => line.length > 0);
+  const current = codexServerLines(toml);
+  if (current && current.length === wanted.length && current.every((line, index) => line === wanted[index])) {
+    return { toml, changed: false };
+  }
+  const stripped = stripCodexAgentRoomServer(toml).replace(/\s+$/, '');
+  const body = stripped ? `${ensureTrailingBlankLine(stripped)}${block.endsWith('\n') ? block : `${block}\n`}` : (block.endsWith('\n') ? block : `${block}\n`);
+  return { toml: body, changed: true };
+}
+
+/** Replace our hook command in place so the trusted index-0 block stays index 0. */
+export function rewriteCodexHookCommands(toml: string, commandLine: string, windowsLine?: string): string {
+  const isHook = (line: string): boolean => new RegExp(HOOK_COMMAND_LINE_RE.source, 'm').test(line);
+  const out: string[] = [];
+  const lines = toml.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (!isHook(line)) {
+      out.push(line);
+      continue;
+    }
+    out.push(commandLine);
+    const next = lines[i + 1] ?? '';
+    if (windowsLine && !/^\s*command_windows\s*=/.test(next)) out.push(windowsLine);
+  }
+  return out.join('\n');
 }
 
 function isAgentRoomHookCommand(command: string): boolean {
@@ -401,15 +491,19 @@ function tryClaudeMcpAdd(claudeBin: string): Promise<boolean> {
   // On Windows with shell:true, pass the bare command name so paths with spaces
   // (e.g. C:\Users\Robin Zhang\...\claude.cmd) are not split by the shell.
   // Bundled node/script paths are quoted for that same shell.
+  const url = hostedMcpUrl();
   const launch = resolveMcpLaunch();
   const command = process.platform === 'win32' ? 'claude' : claudeBin;
   const mcpArgs = [launch.command, ...launch.args].map((arg) =>
     process.platform === 'win32' ? shellQuoteArg(arg, 'win32') : arg
   );
+  const args = url
+    ? ['mcp', 'add', '--scope', 'user', '--transport', 'http', 'agent-room', url]
+    : ['mcp', 'add', '--scope', 'user', 'agent-room', '--', ...mcpArgs];
   return new Promise((resolve) => {
     const p = spawn(
       command,
-      ['mcp', 'add', '--scope', 'user', 'agent-room', '--', ...mcpArgs],
+      args,
       { stdio: 'ignore', shell: process.platform === 'win32' }
     );
     p.on('close', (code) => resolve(code === 0));
@@ -439,7 +533,7 @@ async function installClaudeCode(opts: { hooks: boolean }): Promise<InstallResul
   const mcp = (await readJson(mcpPath)) ?? {};
   const servers = ((mcp.mcpServers as Record<string, unknown>) ?? {});
   const before = JSON.stringify(servers['agent-room']);
-  servers['agent-room'] = { ...resolveMcpLaunch(), env: CLAUDE_CODE_MCP_ENTRY.env };
+  servers['agent-room'] = mcpClientEntry(CLAUDE_CODE_MCP_ENTRY.env);
   mcp.mcpServers = servers;
   if (JSON.stringify(servers['agent-room']) !== before) {
     await writeJsonAtomic(mcpPath, mcp);
@@ -618,7 +712,7 @@ async function installClaude(opts: { hooks: boolean }): Promise<InstallResult> {
   const config = (await readJson(path)) ?? {};
   const servers = ((config.mcpServers as Record<string, unknown>) ?? {});
   const before = JSON.stringify(servers['agent-room']);
-  servers['agent-room'] = { ...resolveMcpLaunch(), env: CLAUDE_DESKTOP_MCP_ENTRY.env };
+  servers['agent-room'] = mcpClientEntry(CLAUDE_DESKTOP_MCP_ENTRY.env);
   config.mcpServers = servers;
 
   if (JSON.stringify(servers['agent-room']) !== before) {
@@ -649,7 +743,7 @@ async function installCursor(opts: { hooks: boolean }): Promise<InstallResult> {
   const data = (await readJson(mcpPath)) ?? {};
   const servers = ((data.mcpServers as Record<string, unknown>) ?? {});
   const beforeServers = JSON.stringify(servers['agent-room']);
-  servers['agent-room'] = resolveMcpLaunch();
+  servers['agent-room'] = mcpClientEntry();
   data.mcpServers = servers;
   if (JSON.stringify(servers['agent-room']) !== beforeServers) {
     await writeJsonAtomic(mcpPath, data);
@@ -711,7 +805,7 @@ async function installAntigravity(): Promise<InstallResult> {
   const data = (await readJson(path)) ?? {};
   const servers = ((data.mcpServers as Record<string, unknown>) ?? {});
   const before = JSON.stringify(servers['agent-room']);
-  servers['agent-room'] = { ...resolveMcpLaunch(), env: ANTIGRAVITY_MCP_ENTRY.env };
+  servers['agent-room'] = mcpClientEntry(ANTIGRAVITY_MCP_ENTRY.env);
   data.mcpServers = servers;
   if (JSON.stringify(servers['agent-room']) !== before) {
     await writeJsonAtomic(path, data);
@@ -756,7 +850,7 @@ async function installCline(): Promise<InstallResult> {
   const data = (await readJson(path)) ?? {};
   const servers = ((data.mcpServers as Record<string, unknown>) ?? {});
   const before = JSON.stringify(servers['agent-room']);
-  servers['agent-room'] = resolveMcpLaunch();
+  servers['agent-room'] = mcpClientEntry();
   data.mcpServers = servers;
   if (JSON.stringify(servers['agent-room']) !== before) {
     await writeJsonAtomic(path, data);
@@ -780,7 +874,9 @@ function vscodeMcpPath(): string {
 }
 
 /** VS Code / Copilot keep their npx (and Windows `cmd /c`) shape until a bundle override is set. */
-function stdioClientEntry(packageArgs: string[]): { type: string; command: string; args: string[]; env: { GITHUB_COPILOT: '1' } } {
+function stdioClientEntry(packageArgs: string[]): { type: string; command?: string; args?: string[]; url?: string; env?: { GITHUB_COPILOT: '1' } } {
+  const url = hostedMcpUrl();
+  if (url) return { type: 'http', url };
   const launch = resolveMcpLaunch();
   const env = { GITHUB_COPILOT: '1' as const };
   if (!isDefaultLaunch(launch)) {
@@ -852,7 +948,16 @@ export async function installCodex(opts: { hooks: boolean }): Promise<InstallRes
 
   let modified = content;
 
-  if (/^\[mcp_servers\.agent-room\]/m.test(modified)) {
+  // A paired server replaces a stale `npx` / stdio block. The hosted `/mcp`
+  // schema is the one that accepts inviteCode, personaId, sessionId, and seatKey.
+  // Without a base URL, leave an existing block alone so a trusted stdio entry
+  // is not rewritten on every init.
+  if (hostedMcpUrl()) {
+    const next = upsertCodexMcpServer(modified, codexMcpServerBlock());
+    modified = next.toml;
+    if (next.changed) result.changes.push(`pointed [mcp_servers.agent-room] at ${hostedMcpUrl()} in ${path}`);
+    else result.unchanged.push(`${path} (mcp_servers.agent-room already present)`);
+  } else if (/^\[mcp_servers\.agent-room\]/m.test(modified)) {
     result.unchanged.push(`${path} (mcp_servers.agent-room already present)`);
   } else {
     modified = ensureTrailingBlankLine(modified);
@@ -890,6 +995,21 @@ export async function installCodex(opts: { hooks: boolean }): Promise<InstallRes
       );
     }
 
+    const hook = hookCommand();
+    const quotedHook = tomlQuoted(hook);
+    // Default `npx` stays put: a differently spelled hook is still ours, and
+    // rewriting it would invalidate Codex's trust hash for no gain. A bundled
+    // or paired-server command must replace `npx`, or Windows keeps launching
+    // a hook that exits 1.
+    if (hook !== HOOK_COMMAND) {
+      const windowsLine = process.platform === 'win32' ? `command_windows = ${quotedHook}` : undefined;
+      const rewritten = rewriteCodexHookCommands(modified, `command = ${quotedHook}`, windowsLine);
+      if (rewritten !== modified) {
+        modified = rewritten;
+        result.changes.push(`updated agent-room hook command in ${path}`);
+      }
+    }
+
     const installedHookCommands = countInstalledCodexHookCommands(modified);
     if (installedHookCommands > 0) {
       result.unchanged.push(`${path} (hooks already installed)`);
@@ -897,7 +1017,8 @@ export async function installCodex(opts: { hooks: boolean }): Promise<InstallRes
       for (const event of HOOK_EVENTS) {
         modified = ensureTrailingBlankLine(modified);
         modified += `[[hooks.${event}]]\nmatcher = ""\n`;
-        modified += `[[hooks.${event}.hooks]]\ntype = "command"\ncommand = ${tomlQuoted(hookCommand())}\n`;
+        modified += `[[hooks.${event}.hooks]]\ntype = "command"\ncommand = ${quotedHook}\n`;
+        if (process.platform === 'win32') modified += `command_windows = ${quotedHook}\n`;
       }
       result.changes.push(`installed Stop / UserPromptSubmit / SessionStart hooks in ${path}`);
     }
@@ -936,11 +1057,11 @@ function printRulesInstruction(target: string, where: string): void {
 
 function printConfigs() {
   const hook = hookCommand();
-  const mcp = JSON.stringify({ mcpServers: { 'agent-room': resolveMcpLaunch() } }, null, 2);
+  const mcp = JSON.stringify({ mcpServers: { 'agent-room': mcpClientEntry() } }, null, 2);
   // Both Claude surfaces get the self-identifying entry — a hand-copied config
   // without the marker is the same silent-dropout bug as one written by init.
-  const claudeMcp = JSON.stringify({ mcpServers: { 'agent-room': { ...resolveMcpLaunch(), env: CLAUDE_CODE_MCP_ENTRY.env } } }, null, 2);
-  const claudeDesktopMcp = JSON.stringify({ mcpServers: { 'agent-room': { ...resolveMcpLaunch(), env: CLAUDE_DESKTOP_MCP_ENTRY.env } } }, null, 2);
+  const claudeMcp = JSON.stringify({ mcpServers: { 'agent-room': mcpClientEntry(CLAUDE_CODE_MCP_ENTRY.env) } }, null, 2);
+  const claudeDesktopMcp = JSON.stringify({ mcpServers: { 'agent-room': mcpClientEntry(CLAUDE_DESKTOP_MCP_ENTRY.env) } }, null, 2);
   const hooks = JSON.stringify({
     hooks: Object.fromEntries(
       HOOK_EVENTS.map((e) => [e, [{ hooks: [{ type: 'command', command: hook }] }]])
